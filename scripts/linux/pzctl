@@ -1,0 +1,119 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+readonly PROJECT_DIRECTORY=/opt/pz-stack
+readonly ENV_FILE=/srv/pz/secrets.env
+readonly WATCHDOG=/opt/pz-watchdog-venv/bin/pz-watchdog
+readonly COMPOSE=(docker compose --project-directory "${PROJECT_DIRECTORY}" --file "${PROJECT_DIRECTORY}/compose.yaml" --env-file "${ENV_FILE}")
+readonly BACKUP_LOCK=/run/pz-server-backup.lock
+export PZ_ENV_FILE="${ENV_FILE}"
+
+usage() {
+    cat <<'EOF'
+Usage: pzctl <command> [arguments]
+
+Commands:
+  start                    Start PZ and the watchdog through systemd
+  save                     Request an RCON world save
+  graceful-stop [--allow-connected-players]
+                           Confirm RCON, save, and stop PZ cleanly
+  restart [--allow-connected-players]
+                           Gracefully stop and start PZ
+  shutdown-host [--allow-connected-players]
+                           Gracefully stop PZ and schedule Linux poweroff
+  status [--json]          Show real players and host/container metrics
+  players                  Print confirmed player count or UNKNOWN
+  wait-ready [--timeout N] Wait for container health and RCON
+  logs                     Follow PZ container logs
+EOF
+}
+
+require_root() {
+    [[ $(id -u) -eq 0 ]] || { echo "pzctl requires root (use SSM/sudo)." >&2; exit 77; }
+}
+
+acquire_lifecycle_lock() {
+    exec 8>"${BACKUP_LOCK}"
+    if ! flock --exclusive --nonblock 8; then
+        echo "A Project Zomboid backup holds the lifecycle lock; refusing this command." >&2
+        exit 75
+    fi
+}
+
+save_world() {
+    "${WATCHDOG}" save
+}
+
+graceful_stop() {
+    local watchdog_was_active=false
+    if systemctl is-active --quiet pz-watchdog.service; then
+        watchdog_was_active=true
+    fi
+    systemctl stop pz-watchdog.service
+    if ! "${WATCHDOG}" graceful-stop "$@"; then
+        echo "Safe stop validation failed; host shutdown is prohibited." >&2
+        if [[ "${watchdog_was_active}" == true ]] && systemctl is-active --quiet pz-stack.service; then
+            systemctl start pz-watchdog.service \
+                || echo "Could not restore the watchdog; manual intervention is required." >&2
+        fi
+        return 1
+    fi
+    if ! systemctl stop pz-stack.service; then
+        echo "Could not transition pz-stack.service to stopped; attempting recovery." >&2
+        systemctl restart pz-stack.service || true
+        if [[ "${watchdog_was_active}" == true ]]; then
+            systemctl start pz-watchdog.service || true
+        fi
+        return 1
+    fi
+    echo "Project Zomboid stopped gracefully."
+}
+
+shutdown_host() {
+    local watchdog_was_active=false
+    if systemctl is-active --quiet pz-watchdog.service; then
+        watchdog_was_active=true
+    fi
+    systemctl stop pz-watchdog.service
+    if ! "${WATCHDOG}" shutdown-host "$@"; then
+        echo "Guarded host shutdown failed; the host remains online." >&2
+        if [[ "${watchdog_was_active}" == true ]] && systemctl is-active --quiet pz-stack.service; then
+            systemctl start pz-watchdog.service || true
+        fi
+        return 1
+    fi
+}
+
+main() {
+    require_root
+    [[ -r "${ENV_FILE}" ]] || { echo "Missing ${ENV_FILE}." >&2; exit 1; }
+    local command="${1:-}"
+    shift || true
+    case "${command}" in
+        start)
+            acquire_lifecycle_lock
+            systemctl start pz-stack.service
+            systemctl start pz-watchdog.service
+            ;;
+        save) save_world ;;
+        graceful-stop) graceful_stop "$@" ;;
+        restart)
+            acquire_lifecycle_lock
+            graceful_stop "$@"
+            systemctl start pz-stack.service
+            systemctl start pz-watchdog.service
+            ;;
+        shutdown-host)
+            acquire_lifecycle_lock
+            shutdown_host "$@"
+            ;;
+        status) exec "${WATCHDOG}" status "$@" ;;
+        players) exec "${WATCHDOG}" players "$@" ;;
+        wait-ready) exec "${WATCHDOG}" wait-ready "$@" ;;
+        logs) exec "${COMPOSE[@]}" logs --follow server ;;
+        help|-h|--help) usage ;;
+        *) usage >&2; exit 64 ;;
+    esac
+}
+
+main "$@"

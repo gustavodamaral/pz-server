@@ -1,0 +1,19 @@
+#cloud-config
+write_files:
+  - path: /usr/local/sbin/pz-first-boot
+    owner: root:root
+    permissions: '0750'
+    encoding: b64
+    content: ${bootstrap_script_base64}
+  - path: /etc/pz-bootstrap.env
+    owner: root:root
+    permissions: '0600'
+    content: |
+      DATA_VOLUME_ID_BASE64=${data_volume_id_base64}
+      INITIALIZE_DATA_VOLUME=${initialize_data_volume}
+      REPOSITORY_URL_BASE64=${repository_url_base64}
+      REPOSITORY_REF_BASE64=${repository_ref_base64}
+runcmd:
+  - ["/usr/local/sbin/pz-first-boot"]
+
+final_message: "pz-server cloud-init finished after $UPTIME seconds"

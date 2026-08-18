@@ -1,0 +1,20 @@
+# Copy to terraform.tfvars and adjust non-secret infrastructure inputs only.
+# Never put PZ passwords, RCON passwords, or AWS credentials in this file.
+
+aws_region           = "us-east-1"
+project_name         = "pz-server"
+environment          = "production"
+normal_instance_type = "r7a.large"
+party_instance_type  = "m7a.xlarge"
+data_volume_size_gib = 40
+
+# Keep false for existing volumes and snapshot restores. For a brand-new blank
+# volume only, set true for the initial apply, then immediately restore false
+# and apply again so replacement hosts can never format it.
+initialize_blank_data_volume = false
+
+# Restrict these when every player has a stable public egress CIDR.
+allowed_game_cidrs = ["0.0.0.0/0"]
+
+repository_url = "https://github.com/gustavodamaral/pz-server.git"
+repository_ref = "REPLACE_WITH_THE_EXACT_40_CHARACTER_COMMIT_SHA"

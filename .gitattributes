@@ -1,0 +1,5 @@
+* text=auto
+*.sh text eol=lf
+scripts/linux/pzctl text eol=lf
+Dockerfile text eol=lf
+*.tftpl text eol=lf

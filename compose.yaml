@@ -1,0 +1,114 @@
+name: ${COMPOSE_PROJECT_NAME:-pz-server}
+
+services:
+  server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        PZ_UID: ${PZ_UID:-1000}
+        PZ_GID: ${PZ_GID:-1000}
+    image: pz-server:local
+    hostname: pz-server
+    restart: ${RESTART_POLICY:-unless-stopped}
+    stop_grace_period: 120s
+    environment:
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?Set ADMIN_PASSWORD in .env}
+      ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
+      DIRECT_PORT: ${DIRECT_PORT:-16262}
+      GAME_PORT: ${GAME_PORT:-16261}
+      MAP_NAMES: ${MAP_NAMES:-Muldraugh, KY}
+      MAX_PLAYERS: ${MAX_PLAYERS:-16}
+      MODS: ${MODS:-}
+      PZ_SERVER_NAME: ${PZ_SERVER_NAME:-pzserver}
+      PZ_XMS: ${PZ_XMS:-2g}
+      PZ_XMX: ${PZ_XMX:-8g}
+      RCON_PASSWORD: ${RCON_PASSWORD:?Set RCON_PASSWORD in .env}
+      RCON_PORT: ${RCON_PORT:-27015}
+      SERVER_PASSWORD: ${SERVER_PASSWORD:?Set SERVER_PASSWORD in .env}
+      SERVER_PUBLIC_NAME: ${SERVER_PUBLIC_NAME:-Friends Project Zomboid Build 42}
+      SHUTDOWN_GRACE_SECONDS: ${SHUTDOWN_GRACE_SECONDS:-90}
+      SHUTDOWN_SAVE_SECONDS: ${SHUTDOWN_SAVE_SECONDS:-15}
+      STATISTICS_PERIOD: ${STATISTICS_PERIOD:-0}
+      STEAM_APP_ID: ${STEAM_APP_ID:-380870}
+      STEAM_BRANCH: ${STEAM_BRANCH:-}
+      STEAM_BRANCH_PASSWORD: ${STEAM_BRANCH_PASSWORD:-}
+      STEAM_VALIDATE: ${STEAM_VALIDATE:-false}
+      TZ: ${TZ:-UTC}
+      UPDATE_ON_START: ${UPDATE_ON_START:-false}
+      WORKSHOP_ITEMS: ${WORKSHOP_ITEMS:-}
+    ports:
+      - "${GAME_BIND_ADDRESS:-0.0.0.0}:${GAME_PORT:-16261}:${GAME_PORT:-16261}/udp"
+      - "${GAME_BIND_ADDRESS:-0.0.0.0}:${DIRECT_PORT:-16262}:${DIRECT_PORT:-16262}/udp"
+      - "127.0.0.1:${RCON_PORT:-27015}:${RCON_PORT:-27015}/tcp"
+    volumes:
+      - type: bind
+        source: ${PZ_SERVER_PATH:-./runtime/server}
+        target: /opt/pzserver
+      - type: bind
+        source: ${PZ_DATA_PATH:-./runtime/zomboid}
+        target: /home/pz/Zomboid
+      - type: bind
+        source: ./config/templates
+        target: /config
+        read_only: true
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/pz-healthcheck"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 15m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 512
+    cpus: ${CONTAINER_CPUS:-2.0}
+    mem_limit: ${CONTAINER_MEMORY_LIMIT:-10g}
+    logging:
+      driver: json-file
+      options:
+        max-size: 20m
+        max-file: "5"
+
+  watchdog:
+    profiles: ["watchdog"]
+    build:
+      context: .
+      dockerfile: watchdog/Dockerfile
+    image: pz-watchdog:local
+    init: true
+    restart: ${RESTART_POLICY:-unless-stopped}
+    depends_on:
+      server:
+        condition: service_healthy
+    command: ["run"]
+    environment:
+      DEPLOYMENT_ENVIRONMENT: local
+      DRY_RUN: "true"
+      FINAL_CHECK_COUNT: ${FINAL_CHECK_COUNT:-3}
+      FINAL_CHECK_DELAY_SECONDS: ${FINAL_CHECK_DELAY_SECONDS:-5}
+      HEALTH_FAILURE_TIMEOUT_MINUTES: ${HEALTH_FAILURE_TIMEOUT_MINUTES:-12}
+      HOST_SHUTDOWN_ENABLED: "false"
+      IDLE_TIMEOUT_MINUTES: ${IDLE_TIMEOUT_MINUTES:-45}
+      POLL_INTERVAL_SECONDS: ${POLL_INTERVAL_SECONDS:-60}
+      RCON_HOST: server
+      RCON_PASSWORD: ${RCON_PASSWORD:?Set RCON_PASSWORD in .env}
+      RCON_PORT: ${RCON_PORT:-27015}
+      RCON_RETRY_COUNT: ${RCON_RETRY_COUNT:-3}
+      RCON_RETRY_DELAY_SECONDS: ${RCON_RETRY_DELAY_SECONDS:-5}
+      RCON_TIMEOUT_SECONDS: ${RCON_TIMEOUT_SECONDS:-10}
+      SERVICE_CONTROL_MODE: tcp-only
+      SERVICE_STOP_TIMEOUT_SECONDS: ${SERVICE_STOP_TIMEOUT_SECONDS:-120}
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"

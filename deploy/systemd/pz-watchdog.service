@@ -1,0 +1,27 @@
+[Unit]
+Description=Project Zomboid conservative idle watchdog
+Documentation=https://github.com/gustavodamaral/pz-server/blob/main/docs/watchdog.md
+Requires=pz-stack.service
+After=pz-stack.service
+PartOf=pz-stack.service
+
+[Service]
+Type=simple
+EnvironmentFile=/srv/pz/secrets.env
+ExecStart=/opt/pz-watchdog-venv/bin/pz-watchdog run
+Restart=on-failure
+RestartSec=15s
+TimeoutStopSec=30s
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+LockPersonality=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target

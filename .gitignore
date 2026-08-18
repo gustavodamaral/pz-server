@@ -1,0 +1,72 @@
+# Secrets and local environment
+.env
+.env.*
+!.env.example
+secrets/
+*.secret
+*.pem
+
+# Project Zomboid runtime and downloaded binaries
+runtime/
+Zomboid/
+steamapps/
+steamcmd/
+*.dmp
+core
+core.*
+hs_err_pid*.log
+replay_pid*.log
+*.log
+
+# Backups and archives
+backups/
+*.tar
+*.tar.gz
+*.tgz
+*.zip
+
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.log
+crash.*.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+terraform.tfvars
+*.auto.tfvars
+!terraform.tfvars.example
+# .terraform.lock.hcl is intentionally tracked.
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+dist/
+build/
+
+# Editors and operating systems
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+*.bak
