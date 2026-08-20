@@ -4,7 +4,7 @@ Production-oriented, self-hosted Project Zomboid Build 42 infrastructure for a s
 
 The world is configured with **`PauseEmpty=true`**. Game time stops whenever no players are connected, so crops, food, generators, animals, and other simulation state do not advance merely because the server remains online during the idle grace period.
 
-No Project Zomboid binaries are stored in Git or baked into the image. SteamCMD downloads dedicated-server App `380870` from Valve into a persistent runtime mount.
+No Project Zomboid binaries are stored in Git or baked into the image. The conservative updater queries and downloads dedicated-server App `380870` from Valve into isolated managed releases on a persistent runtime mount.
 
 ## Architecture
 
@@ -30,8 +30,8 @@ flowchart LR
 | --- | --- |
 | Terraform | Network, security group, IAM/SSM, EC2, independent persistent EBS, and optional cost notifications |
 | cloud-init | First-boot Docker installation, explicitly authorized volume initialization, and immutable repository checkout |
-| Docker/Compose | PZ dependencies, SteamCMD update, configuration, ports, persistence, health, signals |
-| systemd | Start Compose and watchdog on boot; recover services after a reboot |
+| Docker/Compose | PZ dependencies, isolated Steam candidates, configuration, ports, persistence, health, signals |
+| systemd | Serialize startup with lifecycle operations; start Compose and watchdog after a reboot |
 | Python watchdog | Confirm players, track continuous idle time, recover unhealthy PZ, safely stop EC2 |
 | PowerShell | Idempotent manual start/resize/status/graceful stop from Windows |
 
@@ -39,7 +39,7 @@ See [architecture details](docs/architecture.md) for boundaries and failure beha
 
 ## Cost Philosophy
 
-The EC2 instance normally remains **stopped**. Compute charges accrue only while it runs, but the encrypted EBS volumes continue to incur storage charges while stopped. AWS also charges for public IPv4 use according to its current pricing; this project deliberately creates no Elastic IP, NAT Gateway, load balancer, managed database, or default paid observability stack.
+The EC2 instance normally remains **stopped**. Compute charges accrue only while it runs, but the encrypted EBS volumes continue to incur storage charges while stopped. The disposable root default is 32 GiB so one active Steam release and one isolated candidate fit with operating-system/Docker headroom; reducing it can make updates fail safely for insufficient space. AWS also charges for public IPv4 use according to its current pricing; this project deliberately creates no Elastic IP, NAT Gateway, load balancer, managed database, or default paid observability stack.
 
 AWS prices and policies change. Check the current AWS Pricing Calculator rather than treating any old estimate as permanent. Optional EC2 detailed monitoring is off by default. An opt-in, notification-only AWS Budget can email account-wide actual and forecast monthly-cost warnings without creating automated actions or SNS infrastructure.
 
@@ -51,7 +51,9 @@ Dockerfile                   Custom non-root PZ/SteamCMD image
 config/templates/            Version-controlled managed PZ settings
 docker/                      Entrypoint, health, and console helpers
 src/pz_watchdog/             Typed watchdog, RCON adapter, metrics, CLI
+src/pz_updater/              Tested Steam metadata, release, backup, and acceptance state machine
 watchdog/tests/              Safety-state and failure-path tests
+updater/tests/               Update transaction and fault-injection tests
 scripts/linux/               Host installer, pzctl, consistent backup
 scripts/windows/             AWS lifecycle/status and local backup helpers
 deploy/systemd/              Production services
@@ -75,6 +77,7 @@ Allocate enough Docker Desktop memory for the selected JVM and container limits.
 ```powershell
 Copy-Item .env.example .env
 notepad .env
+New-Item -ItemType Directory -Force runtime\server, runtime\zomboid, runtime\deploy, backups\pre-update
 docker compose build
 docker compose up -d
 docker compose logs -f server
@@ -108,17 +111,18 @@ The verified current Build 42 ports are `16261/udp` (primary gameplay) and `1626
 
 Important local values are centralized in `.env`; safe examples and comments are in `.env.example`. Windows AWS helpers also read only the five non-secret helper keys listed at the bottom of that file. Terraform remains authoritative for provisioned tags and instance types, which it writes onto the instance for the helpers to discover. `PZ_SERVER_NAME` is the filesystem/save identifier and accepts only letters, numbers, `_`, and `-`. `SERVER_PUBLIC_NAME` is the display name.
 
-On each start, `config/templates/server.ini.template` is rendered and its managed keys are merged into the persistent runtime INI. Generated IDs and unknown settings are preserved. PZ creates the current vanilla Build 42 sandbox and spawn files itself, preventing stale Build 41 templates from silently replacing current defaults.
+On each start, `config/templates/server.ini.template` is rendered and its managed keys are merged into the persistent runtime INI. Generated IDs and unknown settings are preserved. Before a gameplay session, `PZ_UPDATE_POLICY=stable-on-start` checks only Steam's public branch; `manual` skips that check. PZ creates the current vanilla Build 42 sandbox and spawn files itself, preventing stale Build 41 templates from silently replacing current defaults.
 
 Runtime locations:
 
 | Content | Local path | Container path |
 | --- | --- | --- |
-| Downloaded server binaries | `runtime/server` | `/opt/pzserver` |
+| Managed server releases/state | `runtime/server` | `/opt/pzserver` |
 | Complete persistent PZ user data | `runtime/zomboid` | `/home/pz/Zomboid` |
 | Saves/world | `runtime/zomboid/Saves/Multiplayer` | `/home/pz/Zomboid/Saves/Multiplayer` |
 | Generated server config | `runtime/zomboid/Server` | `/home/pz/Zomboid/Server` |
 | Logs | `runtime/zomboid/Logs` and `console.txt` | `/home/pz/Zomboid/Logs` |
+| Automatic pre-update backups | `backups/pre-update` | `/backups` |
 
 ### PauseEmpty
 
@@ -174,9 +178,9 @@ python -m venv .venv
 .\.venv\Scripts\ruff format --check .
 ```
 
-Host status reads real CPU utilization per core, hottest core, total/available memory, PZ JVM RSS when the host PID is visible, boot/container uptime, disk usage, container health, and RCON player count. On Docker Desktop, Linux PIDs live inside its VM; if the JVM RSS cannot be observed honestly, status reports `unavailable` rather than inventing a value.
+Host status reads real CPU utilization per core, hottest core, total/available memory, PZ JVM RSS when the host PID is visible, boot/container uptime, disk usage, container health, RCON player count, active Steam build, PZ version/revision when observed, and update state. On Docker Desktop, Linux PIDs live inside its VM; if the JVM RSS cannot be observed honestly, status reports `unavailable` rather than inventing a value.
 
-The JSON form used by AWS tooling is `pz-watchdog status --json`.
+The JSON form used by AWS tooling is `pz-watchdog status --json`. Container-local update detail is available with `docker compose exec -T server pz-updater status`.
 
 ## Local Resource-Limit Testing
 
@@ -235,19 +239,19 @@ On AWS, run `sudo pz-backup` through Session Manager. Its archive is on the same
 
 ## Updating Project Zomboid
 
-The default empty `STEAM_BRANCH` selects current stable Build 42, while `UPDATE_ON_START=false` prevents an ordinary restart from silently changing binaries. A missing first installation is still downloaded. Steam branches are mutable, so operational reproducibility requires an explicit update window plus backups.
+`PZ_UPDATE_POLICY=stable-on-start` is the default for new installations. An empty `STEAM_BRANCH` means Steam's public branch. The updater checks only before a new gameplay session; it does not poll, mutate an active session, or wake EC2. Existing hosts with legacy `UPDATE_ON_START=false` are migrated to `PZ_UPDATE_POLICY=manual` so a repository deployment cannot silently change their prior behavior.
 
-1. Confirm zero players and create a backup.
-2. Read current PZ release notes and mod compatibility notes.
-3. Leave `STEAM_BRANCH=` for stable, or set a verified beta/legacy branch explicitly.
-4. Set `UPDATE_ON_START=true`; set `STEAM_VALIDATE=true` only when repairing files.
-5. Run `docker compose up -d --force-recreate server`. `restart` alone does not apply changed environment values.
-6. Inspect logs, health, RCON, and a test connection before inviting players.
-7. Reset `UPDATE_ON_START=false` and `STEAM_VALIDATE=false`, then run `docker compose up -d --force-recreate server` once more. This restart skips SteamCMD update and returns to controlled behavior.
+When a newer public build exists, the updater downloads it into an isolated candidate, validates the App `380870` manifest and launcher structure, creates and verifies a `pz-pre-update-*.tar.gz` world backup, then atomically selects the candidate. The previous release remains selected on every failure before world access. Once the candidate may have opened the real world, readiness failure becomes `failed-after-world-open` and automatic binary rollback is prohibited because the world may have migrated.
 
-Never downgrade a world without a compatible backup.
+Operational controls:
 
-On AWS, make the same flag changes in `/srv/pz/secrets.env` and use `sudo pzctl restart`; Compose recreates the stopped container when its environment changes. Reset both flags and run the guarded restart again after validation.
+- Use `PZ_UPDATE_POLICY=manual` before a session when release notes, mod compatibility, or a known Stable regression require review.
+- Automatic updates are blocked when `MODS` or `WORKSHOP_ITEMS` is non-empty unless `ALLOW_AUTO_UPDATE_WITH_MODS=true` was set deliberately.
+- `STEAM_BRANCH` may name a non-public branch only with `PZ_UPDATE_POLICY=manual`, followed by an explicit update. No branch is silently inferred and automatic downgrade is always refused.
+- On AWS, run `sudo pzctl update`; add `--validate` only for an explicit Steam repair. This command owns the lifecycle lock, requires a safe zero-player stop, stages the candidate, restarts, and accepts it only after health, exact RCON, and watchdog readiness.
+- Locally, ordinary `docker compose up -d server` applies the configured startup policy. Inspect `pz-updater status` and complete the client acceptance checklist before inviting players after a real build change.
+
+Git repository deployment and Steam game updating are independent transactions. The root-owned repository pending marker is mounted read-only and suppresses game checks and flat-layout migration during target start/rollback. After a managed release layout exists, `pzctl deploy` refuses a pre-updater repository commit. Never hand-edit release pointers or combine old binaries with a world touched by a newer candidate.
 
 ## Adding Mods Later
 
@@ -320,7 +324,7 @@ Party mode, only when stopped:
 .\scripts\windows\Start-PZ.ps1 -Mode Party
 ```
 
-The script finds exactly one instance by `Project`, `Environment`, and `Role` tags. It refuses live resize, obtains the normal/party allowlist from Terraform-managed instance tags unless explicitly overridden, waits for EC2 checks and SSM, waits for PZ health/RCON, then reports the current public IP. The production container may use up to four CPUs, so normal mode receives the host's two CPUs and party mode can use all four. Terraform ignores deliberate `instance_type` drift so an unrelated apply does not undo party mode.
+The script finds exactly one instance by `Project`, `Environment`, and `Role` tags. It refuses live resize, obtains the normal/party allowlist from Terraform-managed instance tags unless explicitly overridden, waits for EC2 checks and SSM, then requires the lifecycle-serialized update/start, PZ health, exact RCON, updater acceptance, and an active watchdog before reporting the current public IP and Steam build. The production container may use up to four CPUs, so normal mode receives the host's two CPUs and party mode can use all four. Terraform ignores deliberate `instance_type` drift so an unrelated apply does not undo party mode.
 
 No Elastic IP is allocated. Expect a new public IPv4 address after stop/start.
 
@@ -333,7 +337,7 @@ $commit = git rev-parse HEAD
 .\scripts\windows\Deploy-PZ.ps1 -CommitSha $commit
 ```
 
-The helper accepts no branch, repository URL, credentials, or arbitrary remote command. Through SSM, `pzctl deploy` fetches and verifies the exact SHA and preflights its shell/Compose/systemd safety inputs before interruption. It then takes the lifecycle lock, refuses connected players or `UNKNOWN`, confirms a save, stops the exact container cleanly, preserves the previous recovery tooling, installs the target, and requires health, valid RCON, and an active watchdog. A root-only pending marker blocks partial state from booting after interruption; retry the same SHA to resume. If the target fails, rollback is attempted only when the target can first be proven stopped safely; ambiguity leaves the host online for diagnosis. `-AllowConnectedPlayers` is only for announced maintenance and never overrides `UNKNOWN`.
+The helper accepts no branch, repository URL, credentials, or arbitrary remote command. Through SSM, `pzctl deploy` fetches and verifies the exact SHA and preflights its shell/Compose/systemd safety inputs before interruption. It then takes the lifecycle lock, refuses connected players or `UNKNOWN`, confirms a save, stops the exact container cleanly, preserves the previous recovery tooling, installs the target, and requires health, valid RCON, accepted game state, and an active watchdog. A root-only pending marker blocks partial state from booting after interruption and suppresses the independent Steam transaction; retry the same SHA to resume. If the target fails, rollback is attempted only when the target can first be proven stopped safely; ambiguity leaves the host online for diagnosis. `-AllowConnectedPlayers` is only for announced maintenance and never overrides `UNKNOWN`.
 
 ## AWS Status
 
@@ -349,7 +353,7 @@ Instance: r7a.large
 PZ: offline
 ```
 
-For a running host, status uses SSM to collect real metrics and RCON count. An SSM/RCON failure reports `UNKNOWN`; it never reports zero by inference.
+For a running host, status uses SSM to collect real metrics, RCON count, Steam build, updater state, and observed PZ version/revision. An SSM/RCON failure reports `UNKNOWN`; it never reports zero by inference. A failed update remains visible independently from host and player status.
 
 ## Stopping AWS
 
@@ -369,7 +373,7 @@ The script refuses known connected players and `UNKNOWN` state by default, then 
 
 | Event | Result |
 | --- | --- |
-| Container recreated/rebuilt | Bind-mounted binaries and all PZ user data survive |
+| Container recreated/rebuilt | Bind-mounted managed releases/state and all PZ user data survive |
 | `docker compose down` | Data survives |
 | EC2 stopped/started | Independent EBS volume and secrets remain attached; public IP can change |
 | EC2 instance replaced | Terraform reattaches the independently managed volume in the same AZ; root tools/binaries are rebuilt |
@@ -392,7 +396,7 @@ To delete the world intentionally, remove the lifecycle protection in a reviewed
 
 ## Monitoring
 
-The built-in status CLI supplies low-cost on-demand metrics without CloudWatch custom metrics. JSON output is suitable for a future CloudWatch Agent `exec`/StatsD integration, but the agent and paid log/metric ingestion are not enabled by default. Standard EC2 basic monitoring remains available. Disk I/O can be added through `psutil` or CloudWatch Agent when a measured need justifies it.
+The built-in status CLI supplies low-cost on-demand metrics and whitelisted update state without CloudWatch custom metrics. JSON output is suitable for a future CloudWatch Agent `exec`/StatsD integration, but the agent and paid log/metric ingestion are not enabled by default. Standard EC2 basic monitoring remains available. Disk I/O can be added through `psutil` or CloudWatch Agent when a measured need justifies it.
 
 ## Security
 

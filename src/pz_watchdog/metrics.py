@@ -10,6 +10,14 @@ from typing import Any
 
 import psutil
 
+from pz_updater.core import (
+    STATE_FILE,
+    ReleaseLayout,
+    StateStore,
+    UpdateError,
+    read_installed_metadata,
+)
+
 from .models import PlayerObservation
 from .service import DockerComposeService, ServiceHealth, ServiceInspectionError
 
@@ -31,6 +39,7 @@ class StatusSnapshot:
     disk_used_bytes: int
     disk_total_bytes: int
     disk_free_bytes: int
+    update: dict[str, object]
     collected_at: str
 
     def as_dict(self) -> dict[str, Any]:
@@ -38,9 +47,19 @@ class StatusSnapshot:
 
 
 class MetricsCollector:
-    def __init__(self, service: DockerComposeService, data_path: Path) -> None:
+    def __init__(
+        self,
+        service: DockerComposeService,
+        data_path: Path,
+        server_path: Path,
+        update_policy: str,
+        steam_branch: str,
+    ) -> None:
         self.service = service
         self.data_path = data_path
+        self.server_path = server_path
+        self.update_policy = update_policy
+        self.steam_branch = steam_branch
 
     def collect(self, players: PlayerObservation) -> StatusSnapshot:
         per_core = [round(value, 1) for value in psutil.cpu_percent(interval=1, percpu=True)]
@@ -73,6 +92,7 @@ class MetricsCollector:
             disk_used_bytes=disk.used,
             disk_total_bytes=disk.total,
             disk_free_bytes=disk.free,
+            update=read_update_status(self.server_path, self.update_policy, self.steam_branch),
             collected_at=datetime.now(UTC).isoformat(),
         )
 
@@ -107,6 +127,82 @@ class MetricsCollector:
         return max(0, int((datetime.now(UTC) - started).total_seconds()))
 
 
+def read_update_status(
+    server_path: Path, update_policy: str, steam_branch: str
+) -> dict[str, object]:
+    result: dict[str, object] = {
+        "state": "uninitialized",
+        "current_build": None,
+        "candidate_build": None,
+        "blocked_build": None,
+        "last_result": None,
+        "last_update_from_build": None,
+        "last_update_to_build": None,
+        "last_check_at": None,
+        "last_successful_update_at": None,
+        "update_policy": update_policy,
+        "steam_branch": steam_branch,
+        "pz_version": None,
+        "pz_revision": None,
+        "detail": None,
+    }
+    store = StateStore(server_path / STATE_FILE)
+    try:
+        state = store.load()
+        state_name = state.get("state")
+        if not isinstance(state_name, str):
+            raise UpdateError("Update state name is malformed")
+        result["state"] = state_name
+        string_fields = (
+            "last_result",
+            "last_check_at",
+            "last_successful_update_at",
+            "pz_version",
+            "pz_revision",
+            "detail",
+        )
+        build_fields = (
+            "current_build",
+            "candidate_build",
+            "blocked_build",
+            "last_update_from_build",
+            "last_update_to_build",
+        )
+        for field in string_fields:
+            value = state.get(field)
+            if value is not None and not isinstance(value, str):
+                raise UpdateError(f"Update state field {field} is malformed")
+            result[field] = value[:500] if isinstance(value, str) else None
+        for field in build_fields:
+            value = state.get(field)
+            if value is not None and (not isinstance(value, int) or isinstance(value, bool)):
+                raise UpdateError(f"Update state field {field} is malformed")
+            result[field] = value
+        for field in ("update_policy", "steam_branch"):
+            value = state.get(field)
+            if isinstance(value, str) and value:
+                result[field] = value
+
+        layout = ReleaseLayout(server_path, store)
+        active = layout.active()
+        if active is None and (server_path / "start-server.sh").is_file():
+            active = server_path
+        if active is not None:
+            result["current_build"] = read_installed_metadata(active, 380870).build_id
+        elif state_name != "uninitialized":
+            raise UpdateError("Update state has no selected game release")
+    except UpdateError as error:
+        result.update(
+            {
+                "state": "unknown",
+                "current_build": None,
+                "candidate_build": None,
+                "detail": str(error)[:500],
+            }
+        )
+    return result
+
+
 def human_bytes(value: int | None) -> str:
     if value is None:
         return "unavailable"
@@ -135,12 +231,21 @@ def human_duration(seconds: int | None) -> str:
 
 def format_status(snapshot: StatusSnapshot) -> str:
     players = "UNKNOWN" if snapshot.players is None else str(snapshot.players)
+    current_build = snapshot.update.get("current_build") or "unavailable"
+    candidate_build = snapshot.update.get("candidate_build") or "none"
     return "\n".join(
         (
             "Project Zomboid",
             f"Status: {snapshot.status}",
             "",
             f"Players: {players}",
+            "",
+            "Update:",
+            f"  State: {snapshot.update.get('state', 'unknown')}",
+            f"  Steam build: {current_build}",
+            f"  Candidate: {candidate_build}",
+            f"  Policy/branch: {snapshot.update.get('update_policy')} / "
+            f"{snapshot.update.get('steam_branch')}",
             "",
             "CPU:",
             f"  Total: {snapshot.cpu_total_percent:.1f}%",

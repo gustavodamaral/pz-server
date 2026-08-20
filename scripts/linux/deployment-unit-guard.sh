@@ -50,5 +50,10 @@ if [[ "${1:-}" == monitor ]]; then
     monitor_deployment "$@"
     exit 0
 fi
+if [[ "${1:-}" == verify-authorization ]]; then
+    [[ $# -eq 1 ]] || exit 64
+    authorization_is_valid
+    exit
+fi
 [[ $# -eq 0 ]] || exit 64
 [[ ! -e "${PENDING_DEPLOYMENT_FILE}" ]] || authorization_is_valid

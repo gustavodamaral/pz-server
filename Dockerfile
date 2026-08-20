@@ -31,6 +31,7 @@ ENV LANG=en_US.UTF-8 \
     LC_ALL=en_US.UTF-8 \
     HOME=/home/pz \
     PATH=/opt/steamcmd:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    PYTHONPATH=/opt/pz-updater \
     STEAMCMD_DIR=/opt/steamcmd \
     PZ_SERVER_DIR=/opt/pzserver \
     ZOMBOID_DIR=/home/pz/Zomboid
@@ -52,6 +53,7 @@ RUN dpkg --add-architecture i386 \
         locales \
         passwd \
         procps \
+        python3 \
         tar \
         tini \
         util-linux \
@@ -60,18 +62,20 @@ RUN dpkg --add-architecture i386 \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid "${PZ_GID}" pz \
     && useradd --create-home --home-dir /home/pz --uid "${PZ_UID}" --gid "${PZ_GID}" --shell /bin/bash pz \
-    && mkdir --parents /opt/steamcmd /opt/pzserver /home/pz/Zomboid \
+    && mkdir --parents /backups /opt/pz-updater /opt/steamcmd /opt/pzserver /home/pz/Zomboid \
     && curl --fail --location --show-error --silent \
         --output /tmp/steamcmd_linux.tar.gz \
         https://steamcdn-a.akamaihd.net/client/installer/steamcmd_linux.tar.gz \
     && tar --extract --gzip --file /tmp/steamcmd_linux.tar.gz --directory /opt/steamcmd \
     && rm /tmp/steamcmd_linux.tar.gz \
-    && chown --recursive pz:pz /opt/steamcmd /opt/pzserver /home/pz
+    && chown --recursive pz:pz /backups /opt/steamcmd /opt/pzserver /home/pz
 
 COPY --from=rcon-cli /out/rcon-cli /usr/local/bin/rcon-cli
+COPY --chown=root:root src/pz_updater /opt/pz-updater/pz_updater
 COPY --chmod=0755 docker/entrypoint.sh /usr/local/bin/pz-entrypoint
 COPY --chmod=0755 docker/healthcheck.sh /usr/local/bin/pz-healthcheck
 COPY --chmod=0755 docker/console.sh /usr/local/bin/pz-console
+COPY --chmod=0755 docker/updater.sh /usr/local/bin/pz-updater
 
 USER pz:pz
 WORKDIR /opt/pzserver
@@ -79,5 +83,5 @@ WORKDIR /opt/pzserver
 EXPOSE 16261/udp 16262/udp 27015/tcp
 
 STOPSIGNAL SIGTERM
-HEALTHCHECK --interval=30s --timeout=10s --start-period=15m --retries=5 CMD ["/usr/local/bin/pz-healthcheck"]
+HEALTHCHECK --interval=30s --timeout=10s --start-period=2h --retries=5 CMD ["/usr/local/bin/pz-healthcheck"]
 ENTRYPOINT ["/usr/bin/tini", "-g", "--", "/usr/local/bin/pz-entrypoint"]

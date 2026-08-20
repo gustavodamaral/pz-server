@@ -27,6 +27,8 @@ def test_safe_defaults(tmp_path: Path) -> None:
     assert settings.rcon_retry_count == 3
     assert settings.dry_run is True
     assert settings.rcon_cli_command == ("rcon-cli",)
+    assert settings.update_policy == "stable-on-start"
+    assert settings.steam_branch == "public"
 
 
 @pytest.mark.parametrize(
@@ -38,6 +40,7 @@ def test_safe_defaults(tmp_path: Path) -> None:
         ("SERVICE_CONTROL_MODE", "magic"),
         ("DEPLOYMENT_ENVIRONMENT", "desktop"),
         ("FINAL_CHECK_COUNT", "1"),
+        ("PZ_UPDATE_POLICY", "automatic"),
     ],
 )
 def test_invalid_settings_fail(name: str, value: str, tmp_path: Path) -> None:
@@ -98,3 +101,21 @@ def test_invalid_dotenv_line_fails(tmp_path: Path) -> None:
     dotenv.write_text("not-an-assignment\n", encoding="utf-8")
     with pytest.raises(ConfigurationError, match="line 1"):
         Settings.from_environment(environment(tmp_path, PZ_ENV_FILE=str(dotenv)))
+
+
+def test_legacy_update_setting_is_mapped_without_changing_behavior(tmp_path: Path) -> None:
+    disabled = Settings.from_environment(environment(tmp_path, UPDATE_ON_START="false"))
+    enabled = Settings.from_environment(environment(tmp_path, UPDATE_ON_START="true"))
+    assert disabled.update_policy == "manual"
+    assert enabled.update_policy == "stable-on-start"
+
+
+def test_stable_policy_rejects_non_public_branch(tmp_path: Path) -> None:
+    with pytest.raises(ConfigurationError, match="empty STEAM_BRANCH"):
+        Settings.from_environment(
+            environment(
+                tmp_path,
+                PZ_UPDATE_POLICY="stable-on-start",
+                STEAM_BRANCH="unstable",
+            )
+        )

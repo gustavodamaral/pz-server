@@ -25,6 +25,7 @@ htmlcov
 *.dmp
 core
 core.*
+!src/pz_updater/core.py
 docs
 scripts/windows
 watchdog/tests

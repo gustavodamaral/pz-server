@@ -4,14 +4,26 @@
 
 - Inspect `docker compose logs server` for Valve connectivity, disk-full, or branch errors.
 - Confirm App ID remains `380870` in official PZ guidance.
-- An empty `STEAM_BRANCH` means stable. Do not invent `stable` as a beta branch; the entrypoint treats it as default.
+- An empty `STEAM_BRANCH` means public Stable. Non-public branches require `PZ_UPDATE_POLICY=manual` and an explicit update.
 - Retry after checking Steam service status and local DNS/proxy/firewall.
-- Set `STEAM_VALIDATE=true` for one controlled repair start, then reset it.
+- Use `sudo pzctl update --validate` only for an explicit AWS repair; validation is not part of ordinary automatic updates.
 - Never delete `runtime/zomboid` to fix a binary download.
+
+Inspect updater state directly:
+
+```powershell
+docker compose exec -T server pz-updater status
+```
+
+- `failed-before-world-open` means the selected known-good release and world were preserved. Review `detail`; use `manual` to keep starting it or explicitly retry after the cause is fixed.
+- `blocked-mods` means automatic Stable updating was intentionally skipped. Review every mod before setting `ALLOW_AUTO_UPDATE_WITH_MODS=true` or performing an explicit update.
+- `failed-after-world-open` means the candidate may have migrated the real world. Do not point older binaries at that world. Keep the host online for diagnosis, review release notes/logs, and either continue forward or restore the matching pre-update world backup during a stopped maintenance window.
+- `downgrade-blocked` is deliberate. Steam build IDs lower than the selected release are never applied automatically.
+- An interrupted candidate is removed on the next preparation. Never hand-edit `active-release`, `previous-release`, or `update-state.json` to make an ambiguous transaction appear successful.
 
 ## Container Is Unhealthy
 
-Docker health requires the Java GameServer process and is deliberately independent of RCON. The readiness command separately requires both process health and a valid local RCON response. During first download/start, container health remains `starting` for up to 15 minutes before process failures count.
+Docker health requires the Java GameServer process and is deliberately independent of RCON. The readiness command separately requires process health, exact RCON, update acceptance, and an active AWS watchdog. During a bounded candidate download/start, container health remains `starting` for up to two hours so the watchdog cannot mistake a legitimate Steam transaction for a management outage. The systemd start wrapper holds the shared lifecycle lock throughout this phase.
 
 ```powershell
 docker compose ps
@@ -20,7 +32,7 @@ docker compose exec server ps -ef
 docker compose exec server pz-healthcheck
 ```
 
-Check bad passwords, port collisions, JVM allocation versus Docker memory, stale Build 41 data, and full disks. The watchdog does not cause Docker itself to restart merely because health is `unhealthy`; production recovery waits for the conservative outage threshold.
+Check bad passwords, port collisions, JVM allocation versus Docker memory, stale Build 41 data, and full disks. Isolated candidates need room for the active release plus a second complete release and operational headroom; never free space by deleting world data or the only verified backup. The watchdog does not cause Docker itself to restart merely because health is `unhealthy`; production recovery waits for the conservative outage threshold.
 
 ## Server Is Not Visible or Reachable
 
@@ -48,10 +60,10 @@ Do not work around UNKNOWN by reading the process list as zero players.
 The container runs UID/GID 1000. Linux bind paths must be writable:
 
 ```bash
-sudo chown -R 1000:1000 runtime/server runtime/zomboid
+sudo chown -R 1000:1000 runtime/server runtime/zomboid backups/pre-update
 ```
 
-On AWS, `/srv/pz/data` and `/var/lib/pz-server` should be `1000:1000`; `/srv/pz/secrets.env` must remain `root:root 0600`. Do not recursively chown the entire `/srv/pz` tree because that would expose secrets.
+On AWS, `/srv/pz/data`, `/srv/pz/backups/pre-update`, and `/var/lib/pz-server` should be writable by UID/GID 1000; `/srv/pz/secrets.env` must remain `root:root 0600`. `/var/lib/pz-deploy` is root-owned and only its existence marker is exposed read-only to the container. Do not recursively chown the entire `/srv/pz` tree because that would expose secrets and manual backups.
 
 ## PZ Exits on JVM Memory
 
@@ -73,11 +85,12 @@ sudo journalctl -u cloud-final -b --no-pager
 sudo systemctl status pz-stack pz-watchdog
 sudo journalctl -u pz-stack -b --no-pager
 sudo docker compose --project-directory /opt/pz-stack --env-file /srv/pz/secrets.env ps
+sudo pzctl status --json
 ```
 
 If `/opt/pz-stack` is absent, verify the Git URL is public and the exact configured commit SHA was pushed. If `/srv/pz` is not mounted, compare `lsblk -o NAME,SERIAL,FSTYPE,MOUNTPOINTS` with Terraform's persistent volume ID. `No filesystem was detected` is intentionally fatal unless this is the first blank volume and one-time initialization was explicitly armed. Never enable formatting or run `mkfs` to repair an existing/damaged volume; snapshot it and diagnose first.
 
-Bootstrap and stack-readiness failures intentionally leave EC2 online because player/save state is unknown. Diagnose through SSM, inspect Docker state, and stop through `Stop-PZ.ps1` only when its guarded path succeeds. If cloud-init's once-only command failed, rerun `/usr/local/sbin/pz-first-boot` only after correcting the cause, or replace the disposable instance through a reviewed Terraform plan. Successful volume mounting consumes host-local format authorization before any later rerun. Enable the optional AWS Budget to detect forgotten failed hosts.
+Bootstrap and stack-readiness failures intentionally leave EC2 online because player/save state is unknown. A lifecycle-lock timeout usually means a backup, repository deployment, explicit update, or systemd startup still owns the transaction; identify that owner rather than deleting the lock file. Diagnose through SSM, inspect Docker/updater state, and stop through `Stop-PZ.ps1` only when its guarded path succeeds. If cloud-init's once-only command failed, rerun `/usr/local/sbin/pz-first-boot` only after correcting the cause, or replace the disposable instance through a reviewed Terraform plan. Successful volume mounting consumes host-local format authorization before any later rerun. Enable the optional AWS Budget to detect forgotten failed hosts.
 
 ## SSM Is Offline
 

@@ -38,6 +38,13 @@ jobs:
       - name: Python tests
         run: pytest
 
+      - name: Updater and status coverage
+        run: >-
+          pytest -o addopts=
+          updater/tests watchdog/tests/test_metrics.py
+          --cov=pz_updater.core --cov=pz_updater.cli --cov=pz_watchdog.metrics
+          --cov-branch --cov-report=term --cov-fail-under=75
+
       - name: ShellCheck
         uses: ludeeus/action-shellcheck@00cae500b08a931fb5698e11e79bfbd38e612a38 # 2.0.0
         with:

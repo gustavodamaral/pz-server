@@ -113,7 +113,13 @@ def status(settings: Settings, as_json: bool) -> int:
     if not isinstance(service, DockerComposeService):
         LOGGER.error("Detailed status requires SERVICE_CONTROL_MODE=docker on the host")
         return 2
-    snapshot = MetricsCollector(service, settings.data_path).collect(players.query())
+    snapshot = MetricsCollector(
+        service,
+        settings.data_path,
+        settings.server_path,
+        settings.update_policy,
+        settings.steam_branch,
+    ).collect(players.query())
     print(snapshot_json(snapshot) if as_json else format_status(snapshot))
     return 0
 

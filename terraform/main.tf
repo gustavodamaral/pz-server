@@ -94,15 +94,13 @@ locals {
     data.aws_ec2_instance_type.party.ebs_encryption_support == "supported",
     data.aws_ec2_instance_type.normal.bare_metal == false,
     data.aws_ec2_instance_type.party.bare_metal == false,
-    data.aws_ec2_instance_type.normal.memory_size >= 16384,
-    data.aws_ec2_instance_type.party.memory_size >= 16384,
   ])
   availability_zone_error = var.availability_zone == null ? (
     "No available AZ in ${var.aws_region} offers both ${var.normal_instance_type} and ${var.party_instance_type}. Choose compatible instance types or another region."
     ) : (
     "availability_zone ${var.availability_zone} is not available for both ${var.normal_instance_type} and ${var.party_instance_type} in ${var.aws_region}. Compatible AZs: ${length(local.compatible_availability_zones) == 0 ? "none" : join(", ", local.compatible_availability_zones)}."
   )
-  instance_type_ami_error = "normal_instance_type and party_instance_type must both provide at least 16 GiB RAM and be non-bare-metal types supporting x86_64, encrypted EBS roots, HVM, and On-Demand usage for the selected Ubuntu AMI and stopped-instance resize workflow."
+  instance_type_ami_error = "normal_instance_type and party_instance_type must both be non-bare-metal types supporting x86_64, encrypted EBS roots, HVM, and On-Demand usage for the selected Ubuntu AMI and stopped-instance resize workflow."
   vpc_network_number = sum([
     for index, octet in split(".", cidrhost(var.vpc_cidr, 0)) : tonumber(octet) * pow(256, 3 - index)
   ])

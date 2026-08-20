@@ -6,7 +6,7 @@
 - Security group with only verified Build 42 `16261/udp` and `16262/udp` ingress
 - EC2 instance with no key pair/public SSH, IMDSv2 required, guest shutdown set to `stop`
 - IAM role/profile with `AmazonSSMManagedInstanceCore`
-- Disposable encrypted gp3 root volume
+- Disposable encrypted 32 GiB gp3 root volume with headroom for one isolated Steam candidate
 - Independent encrypted 40 GiB gp3 world volume with baseline 3,000 IOPS/125 MiB/s and `prevent_destroy`
 - Optional account-wide AWS Budget with direct warning/critical email notifications and no actions
 
@@ -39,7 +39,7 @@ sudo pzctl logs
 
 Common first-boot blockers are missing one-time initialization authorization, an unreachable/private Git URL, a commit not pushed, Steam download delay, Docker Hub/GitHub/Valve egress failure, or the EBS attachment not arriving before the guarded timeout. Network/package/Git operations are bounded, but a failed host remains online for SSM diagnosis because player state is unknown. Enable the optional AWS Budget and stop a failed host through the guarded helper after diagnosis.
 
-`pz-stack.service` considers a successful Compose launch complete; `Start-PZ.ps1` separately waits for process health and RCON. A readiness timeout does not automatically stop the container or host because player state is unknown. Inspect exact Docker/RCON state before any EC2 action.
+`pz-stack.service` holds the shared lifecycle lock and waits for Compose process health, including any bounded pre-session Steam candidate transaction. `Start-PZ.ps1` separately requires exact RCON, updater acceptance, and an active watchdog before printing the current address/build. A readiness timeout does not automatically stop the container or host because player state is unknown. Inspect exact Docker/RCON/updater state before any EC2 action.
 
 ## Secret Lifecycle
 
@@ -61,7 +61,7 @@ The defaults are `r7a.large` (2 vCPUs, 16 GiB) for normal sessions and `m7a.xlar
 
 This also means changing `normal_instance_type` in Terraform does not resize an existing instance automatically. Use the stopped helper or deliberately revise the lifecycle strategy in a reviewed change.
 
-Terraform queries `DescribeInstanceTypeOfferings` for both configured types, intersects those results with standard currently available AZs, sorts the common names, and uses the first name when `availability_zone` is null. Enabled Local Zones are excluded to prevent an edge location from silently changing geography or cost. An explicit AZ must be in the same common set. Terraform also requires both types to provide at least 16 GiB RAM, be non-bare-metal, and support the selected Ubuntu AMI's `x86_64`, encrypted EBS-root, HVM, and On-Demand contract; dedicated-host-only and undersized classes are outside this design. These account/region queries occur during `plan`; CI runs only account-independent `validate` and never needs AWS credentials.
+Terraform queries `DescribeInstanceTypeOfferings` for both configured types, intersects those results with standard currently available AZs, sorts the common names, and uses the first name when `availability_zone` is null. Enabled Local Zones are excluded to prevent an edge location from silently changing geography or cost. An explicit AZ must be in the same common set. Terraform requires both types to be non-bare-metal and support the selected Ubuntu AMI's `x86_64`, encrypted EBS-root, HVM, and On-Demand contract, but deliberately imposes no universal 16 GiB minimum. The explicit `PZ_XMS`, `PZ_XMX`, and container limit are never adjusted from instance metadata; operators selecting less memory must test and configure those values themselves. These account/region queries occur during `plan`; CI runs only account-independent `validate` and never needs AWS credentials.
 
 After first creation, copy the `availability_zone` output into the explicit variable. This pins the AZ-scoped world volume against future offering-catalog changes; any incompatible type change then fails with a direct message instead of proposing an AZ move. Existing `prevent_destroy` remains the final barrier against accidental volume relocation.
 
@@ -104,7 +104,7 @@ The host transaction performs these steps:
 1. Require an exact 40-character SHA, a clean production checkout, and a credential-free HTTPS origin.
 2. Fetch and verify that SHA before any service interruption, then stage it temporarily for Bash syntax and production Compose rendering checks.
 3. Take the same lifecycle lock used by backups, query real players through RCON, confirm save, and require an exact clean container stop.
-4. Disable any legacy Docker-managed restart policy, record a durable root-only pending transaction, preserve both the previous deployment orchestrator and watchdog environment, check out detached HEAD, atomically reinstall repository-owned host tooling/services, and require Docker health, valid RCON, and a continuously active watchdog service.
+4. Disable any legacy Docker-managed restart policy, record a durable root-only pending transaction, preserve both the previous deployment orchestrator and watchdog environment, check out detached HEAD, atomically reinstall repository-owned host tooling/services, and require Docker health, valid RCON, accepted game-update state, and a continuously active watchdog service. The pending directory is mounted read-only into the game container, suppressing Steam checks and flat-layout migration throughout target start and rollback.
 5. Record the deployed SHA only after readiness. An interrupted exact-SHA retry is routed to the preserved orchestrator and uses the already-fetched local commit instead of treating Git `HEAD` as completion or depending on the network. While pending, systemd start conditions and an independent transient guardian require the live lock-owning transaction to remain present; interruption stops partial services.
 6. On failure, rollback uses the preserved previous watchdog and venv without a new package download. It proceeds only after the target container is missing, cleanly stopped, or passes the guarded stop. Connected players, `UNKNOWN`, OOM, nonzero exit, restart/dead state, Docker error, or inspection failure prohibit automatic rollback and leave the host online for diagnosis.
 
@@ -112,7 +112,22 @@ The host transaction performs these steps:
 
 New hosts record their bootstrap SHA after host installation. For a host created before this deployment marker existed, first call `Deploy-PZ.ps1` with its current `git -C /opt/pz-stack rev-parse HEAD`; this intentionally reinstalls the same reviewed commit to establish a baseline before any different SHA is accepted. The SSM command execution timeout defaults to 150 minutes so the bounded target plus rollback path fits; command delivery has a separate five-minute deadline and the local waiter covers both periods plus polling margin. A timeout leaves the pending marker and requires retrying the same SHA.
 
-Changing installer defaults generally does not rewrite an existing `secrets.env`; adjust a legacy `PZ_XMX=12g` to `8g` during a measured maintenance window. The installer deliberately makes `RESTART_POLICY=no` a managed production invariant, and deployment also updates the existing container before pending state is recorded. Production systemd, not Docker's independent restart manager, must own boot ordering so the container cannot start before `/srv/pz` is mounted.
+Changing installer defaults generally does not rewrite an existing `secrets.env`; adjust a legacy `PZ_XMX=12g` to `8g` during a measured maintenance window. The installer deliberately makes `RESTART_POLICY=no` a managed production invariant. It also migrates legacy `UPDATE_ON_START=false` to `PZ_UPDATE_POLICY=manual` (and `true` to `stable-on-start`) rather than silently changing behavior; new hosts default to automatic public Stable checks. Production systemd, not Docker's independent restart manager, owns boot ordering and the shared lifecycle lock so the container cannot start before `/srv/pz` is mounted or race a backup/deployment.
+
+## Game Updates
+
+Steam game releases are independent from exact-SHA repository deployments. New hosts use `PZ_UPDATE_POLICY=stable-on-start`; the check runs only while starting a new gameplay session. No AWS timer, poller, or scheduled wakeup is created. Empty `STEAM_BRANCH` is public Stable, non-public branches require `manual`, automatic downgrade is prohibited, and configured mods block automatic updating unless explicitly allowed.
+
+For a reviewed maintenance update or repair:
+
+```bash
+sudo pzctl update
+sudo pzctl update --validate  # repair only
+```
+
+`pzctl update` takes `/run/pz-server-backup.lock`, requires known zero players and a confirmed save/clean stop when running, executes the same image-contained updater against the production mounts, then restarts and requires process health, exact RCON, candidate acceptance, and watchdog activity. Candidate installation is isolated under `/var/lib/pz-server/releases`; the world backup is written to `/srv/pz/backups/pre-update` before activation. Default retention is three and may not be set below two.
+
+Use `sudo pzctl status --json` or `Get-PZStatus.ps1` to inspect `update.state`, current/candidate/blocked build, last result, and observed PZ version/revision. `failed-before-world-open` leaves the known-good release online. `failed-after-world-open` never causes automatic binary rollback; review the current release and matching pre-update world archive before any recovery. A managed `active-release` pointer also makes deployment preflight reject repository commits that predate this layout.
 
 ## Intentional EC2 Replacement
 
@@ -130,7 +145,7 @@ Never combine steps 2 and 3. Until a false-only disarm or the reviewed replaceme
 
 ## Persistent Volume and Replacement
 
-The volume is AZ-scoped. Keep the instance/subnet in that AZ. cloud-init identifies it by exact volume ID/serial and distinguishes recognized ext4 from absence of a recognized filesystem. It can format only when the explicit one-time Terraform permission is true and the whole device has no child partitions or signatures. Inspection errors, non-ext4 filesystems, and missing authorization fail without modifying the device.
+The volume is AZ-scoped. Keep the instance/subnet in that AZ. cloud-init identifies it by exact volume ID/serial and distinguishes recognized ext4 from absence of a recognized filesystem. It can format only when the explicit one-time Terraform permission is true and the whole device has no child partitions or signatures. Inspection errors, non-ext4 filesystems, and missing authorization fail without modifying the device. The disposable root volume must still have enough free space for one active release plus one isolated candidate; the updater checks measured free space and fails before world access rather than deleting data.
 
 On intentional EC2 replacement, follow the staged protection workflow above. Terraform detaches/reattaches through `aws_volume_attachment`; never force-detach a mounted active world volume.
 
@@ -161,7 +176,7 @@ Rollback to a snapshot without overwriting the protected current volume:
 
 For a brand-new environment with no current volume, setting `data_volume_snapshot_id` before first creation is sufficient and initialization permission remains false.
 
-`pz-backup` creates a checksum sidecar, retains seven completed archives by default, and uses an exclusive lifecycle lock, but stores archives on the same EBS volume. Copy both files to separately controlled encrypted storage and treat them as secrets because PZ configuration contains server/RCON credentials.
+`pz-backup` creates a checksum sidecar, retains seven completed manual `pz-world-*` archives by default, and uses the exclusive lifecycle lock. Automatic updates separately retain at least two verified `pz-pre-update-*` archives plus checksum/metadata sidecars under a container-writable subdirectory. Both classes remain on the same EBS volume. Copy recovery artifacts to separately controlled encrypted storage and treat them as secrets because PZ configuration contains server/RCON credentials.
 
 Restore a Linux tar backup after copying the archive and sidecar back to `/srv/pz/backups`:
 
@@ -186,4 +201,4 @@ Gameplay defaults to `0.0.0.0/0` because friends may have changing residential I
 
 ## CloudWatch Compatibility
 
-Basic EC2 metrics work without an agent. `enable_detailed_monitoring=true` increases frequency and can add cost. The status CLI emits stable JSON suitable for a future least-privilege CloudWatch Agent configuration. If enabled later, attach only the required log/metric permissions and set explicit retention; do not attach broad CloudWatch policy preemptively.
+Basic EC2 metrics work without an agent. `enable_detailed_monitoring=true` increases frequency and can add cost. The status CLI emits stable JSON, including a whitelisted nested update object, suitable for a future least-privilege CloudWatch Agent configuration. If enabled later, attach only the required log/metric permissions and set explicit retention; do not attach broad CloudWatch policy preemptively.

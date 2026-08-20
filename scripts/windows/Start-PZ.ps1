@@ -9,7 +9,8 @@ param(
     [string] $EnvironmentTag = 'production',
     [string] $NormalInstanceType = 'r7a.large',
     [string] $PartyInstanceType = 'm7a.xlarge',
-    [int] $ReadyTimeoutSeconds = 1800
+    [ValidateRange(30, 7200)]
+    [int] $ReadyTimeoutSeconds = 7200
 )
 
 Set-StrictMode -Version Latest
@@ -79,7 +80,7 @@ Invoke-PZAwsWaiter -Waiter 'instance-status-ok' -InstanceId $instanceId -Region 
 Wait-PZSsmOnline -InstanceId $instanceId -Region $Region -Profile $Profile -TimeoutSeconds 600
 
 $bootstrapWaitSeconds = $ReadyTimeoutSeconds + 600
-$readyCommand = "timeout $bootstrapWaitSeconds bash -lc 'until [ -x /usr/local/bin/pzctl ]; do sleep 10; done; /usr/local/bin/pzctl wait-ready --timeout $ReadyTimeoutSeconds'"
+$readyCommand = "timeout $bootstrapWaitSeconds bash -lc 'until [ -x /usr/local/bin/pzctl ]; do sleep 10; done; unit_state=`$(systemctl is-active pz-stack.service 2>/dev/null || true); case `$unit_state in active|activating) ;; *) /usr/local/bin/pzctl start >&2 ;; esac; /usr/local/bin/pzctl wait-ready --timeout $ReadyTimeoutSeconds'"
 $commandId = Send-PZSsmCommand `
     -InstanceId $instanceId `
     -Region $Region `
@@ -88,12 +89,21 @@ $commandId = Send-PZSsmCommand `
     -DeliveryTimeoutSeconds 120 `
     -Comment 'Wait for Project Zomboid readiness' `
     -Command $readyCommand
-$null = Wait-PZSsmCommand `
+$invocation = Wait-PZSsmCommand `
     -CommandId $commandId `
     -InstanceId $instanceId `
     -Region $Region `
     -Profile $Profile `
     -TimeoutSeconds ($bootstrapWaitSeconds + 210)
+$updateText = ([string] $invocation.StandardOutputContent).Trim()
+if ([string]::IsNullOrWhiteSpace($updateText)) {
+    throw 'Host readiness completed without authoritative game update status.'
+}
+$update = $updateText | ConvertFrom-Json
+$updateState = [string] $update.state
+if ($updateState -notin @('current', 'failed-before-world-open')) {
+    throw "Host readiness returned unsafe game update state '$updateState'."
+}
 
 $instance = Get-PZInstance -Region $Region -Profile $Profile -ProjectTag $ProjectTag -EnvironmentTag $EnvironmentTag
 $publicIp = [string] $instance.PublicIpAddress
@@ -107,3 +117,11 @@ Write-Host "Public IP: $publicIp"
 Write-Host "Instance: $($instance.InstanceType)"
 Write-Host 'State: running'
 Write-Host 'PZ: healthy'
+Write-Host "Steam build: $($update.current_build)"
+Write-Host "Update state: $updateState"
+if (-not [string]::IsNullOrWhiteSpace([string] $update.pz_version)) {
+    Write-Host "PZ version: $($update.pz_version)"
+}
+if ($updateState -eq 'failed-before-world-open') {
+    Write-Warning "Stable update was rejected before world access: $($update.detail)"
+}

@@ -23,13 +23,14 @@ dev = [
 
 [project.scripts]
 pz-watchdog = "pz_watchdog.cli:main"
+pz-updater = "pz_updater.cli:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/pz_watchdog"]
+packages = ["src/pz_updater", "src/pz_watchdog"]
 
 [tool.pytest.ini_options]
 addopts = "--strict-config --strict-markers --cov=pz_watchdog.config --cov=pz_watchdog.engine --cov=pz_watchdog.rcon --cov=pz_watchdog.service --cov=pz_watchdog.shutdown --cov-report=term-missing --cov-fail-under=90"
-testpaths = ["watchdog/tests"]
+testpaths = ["updater/tests", "watchdog/tests"]
 
 [tool.coverage.run]
 branch = true
@@ -44,7 +45,7 @@ exclude_also = [
 [tool.ruff]
 line-length = 100
 target-version = "py311"
-src = ["src", "watchdog/tests"]
+src = ["src", "updater/tests", "watchdog/tests"]
 
 [tool.ruff.lint]
 select = ["B", "E", "F", "I", "LOG", "UP"]

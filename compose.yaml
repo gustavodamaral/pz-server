@@ -15,17 +15,24 @@ services:
     environment:
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:?Set ADMIN_PASSWORD in .env}
       ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
+      ALLOW_AUTO_UPDATE_WITH_MODS: ${ALLOW_AUTO_UPDATE_WITH_MODS:-false}
       CONTAINER_MEMORY_LIMIT: ${CONTAINER_MEMORY_LIMIT:-10g}
+      DEPLOYMENT_ENVIRONMENT: ${DEPLOYMENT_ENVIRONMENT:-local}
       DIRECT_PORT: ${DIRECT_PORT:-16262}
       GAME_PORT: ${GAME_PORT:-16261}
       MAP_NAMES: ${MAP_NAMES:-Muldraugh, KY}
       MAX_PLAYERS: ${MAX_PLAYERS:-16}
       MODS: ${MODS:-}
+      PZ_BACKUP_DIR: /backups
+      PZ_PRE_UPDATE_BACKUP_RETENTION: ${PZ_PRE_UPDATE_BACKUP_RETENTION:-3}
+      PZ_REPOSITORY_DEPLOYMENT_MARKER: /run/pz-deploy/deployment-pending
       PZ_SERVER_NAME: ${PZ_SERVER_NAME:-pzserver}
+      PZ_UPDATE_POLICY: ${PZ_UPDATE_POLICY:-}
       PZ_XMS: ${PZ_XMS:-2g}
       PZ_XMX: ${PZ_XMX:-8g}
       RCON_PASSWORD: ${RCON_PASSWORD:?Set RCON_PASSWORD in .env}
       RCON_PORT: ${RCON_PORT:-27015}
+      RCON_TIMEOUT_SECONDS: ${RCON_TIMEOUT_SECONDS:-10}
       SERVER_PASSWORD: ${SERVER_PASSWORD:?Set SERVER_PASSWORD in .env}
       SERVER_PUBLIC_NAME: ${SERVER_PUBLIC_NAME:-Friends Project Zomboid Build 42}
       SHUTDOWN_GRACE_SECONDS: ${SHUTDOWN_GRACE_SECONDS:-90}
@@ -36,6 +43,7 @@ services:
       STEAM_VALIDATE: ${STEAM_VALIDATE:-false}
       TZ: ${TZ:-UTC}
       UPDATE_ON_START: ${UPDATE_ON_START:-false}
+      UPDATE_READINESS_TIMEOUT_SECONDS: ${UPDATE_READINESS_TIMEOUT_SECONDS:-1800}
       WORKSHOP_ITEMS: ${WORKSHOP_ITEMS:-}
     ports:
       - "${GAME_BIND_ADDRESS:-0.0.0.0}:${GAME_PORT:-16261}:${GAME_PORT:-16261}/udp"
@@ -49,6 +57,13 @@ services:
         source: ${PZ_DATA_PATH:-./runtime/zomboid}
         target: /home/pz/Zomboid
       - type: bind
+        source: ${PZ_PRE_UPDATE_BACKUP_PATH:-./backups/pre-update}
+        target: /backups
+      - type: bind
+        source: ${PZ_DEPLOY_STATE_PATH:-./runtime/deploy}
+        target: /run/pz-deploy
+        read_only: true
+      - type: bind
         source: ./config/templates
         target: /config
         read_only: true
@@ -57,7 +72,7 @@ services:
       interval: 30s
       timeout: 10s
       retries: 5
-      start_period: 15m
+      start_period: 2h
     cap_drop:
       - ALL
     security_opt:
@@ -83,6 +98,8 @@ services:
       server:
         condition: service_healthy
     command: ["run"]
+    group_add:
+      - ${PZ_GID:-1000}
     environment:
       DEPLOYMENT_ENVIRONMENT: local
       DRY_RUN: "true"
@@ -92,6 +109,8 @@ services:
       HOST_SHUTDOWN_ENABLED: "false"
       IDLE_TIMEOUT_MINUTES: ${IDLE_TIMEOUT_MINUTES:-45}
       POLL_INTERVAL_SECONDS: ${POLL_INTERVAL_SECONDS:-60}
+      PZ_STATUS_SERVER_PATH: /status/server
+      PZ_UPDATE_POLICY: ${PZ_UPDATE_POLICY:-}
       RCON_HOST: server
       RCON_PASSWORD: ${RCON_PASSWORD:?Set RCON_PASSWORD in .env}
       RCON_PORT: ${RCON_PORT:-27015}
@@ -100,6 +119,12 @@ services:
       RCON_TIMEOUT_SECONDS: ${RCON_TIMEOUT_SECONDS:-10}
       SERVICE_CONTROL_MODE: tcp-only
       SERVICE_STOP_TIMEOUT_SECONDS: ${SERVICE_STOP_TIMEOUT_SECONDS:-120}
+      STEAM_BRANCH: ${STEAM_BRANCH:-}
+    volumes:
+      - type: bind
+        source: ${PZ_SERVER_PATH:-./runtime/server}
+        target: /status/server
+        read_only: true
     read_only: true
     tmpfs:
       - /tmp:size=16m,mode=1777

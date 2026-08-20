@@ -9,6 +9,7 @@ readonly ROLLBACK_WATCHDOG_VENV=/opt/pz-watchdog-venv.rollback
 readonly COMPOSE=(docker compose --project-directory "${PROJECT_DIRECTORY}" --file "${PROJECT_DIRECTORY}/compose.yaml" --env-file "${ENV_FILE}")
 readonly BACKUP_LOCK=/run/pz-server-backup.lock
 readonly DEPLOY_READY_TIMEOUT_SECONDS=1800
+readonly GAME_READY_TIMEOUT_SECONDS=7200
 readonly DEPLOY_STATE_DIRECTORY=/var/lib/pz-deploy
 readonly DEPLOYED_COMMIT_FILE="${DEPLOY_STATE_DIRECTORY}/deployed-commit"
 readonly PENDING_DEPLOYMENT_FILE="${DEPLOY_STATE_DIRECTORY}/deployment-pending"
@@ -16,6 +17,7 @@ readonly RECOVERY_PZCTL=/usr/local/sbin/pzctl-deploy-recovery
 readonly DEPLOY_START_AUTHORIZATION_FILE=/run/pz-deploy-start-authorized
 DEPLOY_GUARDIAN_SEQUENCE=0
 DEPLOY_GUARDIAN_UNIT=""
+LIFECYCLE_LOCK_OWNED=false
 export PZ_ENV_FILE="${ENV_FILE}"
 
 usage() {
@@ -31,6 +33,7 @@ Commands:
                            Safely deploy one exact 40-character Git commit
   restart [--allow-connected-players]
                            Gracefully stop and start PZ
+  update [--validate]      Stop safely, stage a game release, and verify restart
   shutdown-host [--allow-connected-players]
                            Gracefully stop PZ and schedule Linux poweroff
   status [--json]          Show real players and host/container metrics
@@ -52,6 +55,8 @@ acquire_lifecycle_lock() {
             || { echo "Inherited lifecycle lock verification failed." >&2; exit 75; }
         flock --exclusive --nonblock 9 \
             || { echo "The inherited lifecycle descriptor does not own the lock." >&2; exit 75; }
+        exec 8>&9
+        LIFECYCLE_LOCK_OWNED=true
         return
     fi
     exec 8>"${BACKUP_LOCK}"
@@ -59,6 +64,20 @@ acquire_lifecycle_lock() {
         echo "Another Project Zomboid backup or lifecycle command holds the lock; refusing this command." >&2
         exit 75
     fi
+    LIFECYCLE_LOCK_OWNED=true
+}
+
+acquire_lifecycle_lock_wait() {
+    local timeout_seconds="$1"
+    if [[ "${LIFECYCLE_LOCK_OWNED}" == true ]]; then
+        return
+    fi
+    exec 8>"${BACKUP_LOCK}"
+    if ! flock --exclusive --timeout "${timeout_seconds}" 8; then
+        echo "Timed out waiting for the Project Zomboid lifecycle lock." >&2
+        return 75
+    fi
+    LIFECYCLE_LOCK_OWNED=true
 }
 
 save_world() {
@@ -166,8 +185,10 @@ compose_server_state() {
 disable_server_restart_policy() {
     local count output policy temporary
     count="$(grep --count -- '^RESTART_POLICY=' "${ENV_FILE}" || true)"
-    [[ "${count}" =~ ^[0-9]+$ ]] && (( count <= 1 )) \
-        || { echo "${ENV_FILE} must contain at most one RESTART_POLICY entry." >&2; return 1; }
+    if [[ ! "${count}" =~ ^[0-9]+$ ]] || (( count > 1 )); then
+        echo "${ENV_FILE} must contain at most one RESTART_POLICY entry." >&2
+        return 1
+    fi
     temporary="$(mktemp "${ENV_FILE}.XXXXXX")"
     if ! awk '
         /^RESTART_POLICY=/ { print "RESTART_POLICY=no"; found = 1; next }
@@ -249,15 +270,26 @@ preflight_deployment() {
     fi
     if [[ ! -r "${staging}/scripts/linux/install-host.sh" \
         || ! -r "${staging}/scripts/linux/pzctl" \
-        || ! -r "${staging}/scripts/linux/deployment-unit-guard.sh" ]]; then
+        || ! -r "${staging}/scripts/linux/deployment-unit-guard.sh" \
+        || ! -r "${staging}/scripts/linux/start-stack.sh" ]]; then
         rm -rf -- "${staging}"
         echo "Target commit is missing readable host lifecycle scripts." >&2
         return 1
     fi
+    if [[ -e /var/lib/pz-server/active-release ]]; then
+        if [[ ! -r "${staging}/src/pz_updater/core.py" ]] \
+            || ! grep --quiet --fixed-strings 'pz-updater prepare-start' \
+                "${staging}/docker/entrypoint.sh"; then
+            rm -rf -- "${staging}"
+            echo "Managed game releases prohibit deployment to a pre-updater repository commit." >&2
+            return 1
+        fi
+    fi
     if ! bash -n \
         "${staging}/scripts/linux/install-host.sh" \
         "${staging}/scripts/linux/pzctl" \
-        "${staging}/scripts/linux/deployment-unit-guard.sh"; then
+        "${staging}/scripts/linux/deployment-unit-guard.sh" \
+        "${staging}/scripts/linux/start-stack.sh"; then
         rm -rf -- "${staging}"
         echo "Target host lifecycle scripts failed shell syntax validation." >&2
         return 1
@@ -396,6 +428,85 @@ verify_watchdog_active() {
         || { echo "The watchdog service did not remain active." >&2; return 1; }
 }
 
+game_update_status() {
+    "${COMPOSE[@]}" exec -T server pz-updater status
+}
+
+accept_game_release() {
+    local timeout_seconds="${1:-120}"
+    local deadline=$((SECONDS + timeout_seconds))
+    local status state
+    while (( SECONDS < deadline )); do
+        if ! status="$(game_update_status 2>/dev/null)"; then
+            if [[ -e "${PENDING_DEPLOYMENT_FILE}" ]]; then
+                echo "Updater status is unavailable on a guarded legacy deployment; Steam updates remain suppressed." >&2
+                return 0
+            fi
+            echo "Could not read authoritative game update status." >&2
+            return 1
+        fi
+        if ! jq --exit-status \
+            'type == "object" and (.state | type == "string")' \
+            <<<"${status}" >/dev/null; then
+            echo "Game update status is malformed." >&2
+            return 1
+        fi
+        state="$(jq --raw-output '.state' <<<"${status}")"
+        case "${state}" in
+            current)
+                printf '%s\n' "${status}"
+                return 0
+                ;;
+            failed-before-world-open)
+                echo "The Stable update failed before world access; the known-good release is online." >&2
+                printf '%s\n' "${status}"
+                return 0
+                ;;
+            runtime-ready)
+                if ! status="$("${COMPOSE[@]}" exec -T server pz-updater accept)"; then
+                    echo "Could not accept the externally verified game candidate." >&2
+                    return 1
+                fi
+                ;;
+            pending-readiness|starting-candidate)
+                sleep 2
+                ;;
+            failed-after-world-open|unknown)
+                printf '%s\n' "${status}" >&2
+                echo "Game release requires manual recovery; automatic rollback is prohibited." >&2
+                return 1
+                ;;
+            *)
+                printf '%s\n' "${status}" >&2
+                echo "Game update state '${state}' is not safe to accept." >&2
+                return 1
+                ;;
+        esac
+    done
+    echo "Game runtime became reachable but updater acceptance did not settle." >&2
+    return 1
+}
+
+wait_ready() {
+    local timeout_seconds=900
+    if (( $# == 2 )) && [[ "$1" == --timeout && "$2" =~ ^[0-9]+$ ]]; then
+        timeout_seconds="$2"
+    elif (( $# != 0 )); then
+        echo "Usage: pzctl wait-ready [--timeout N]" >&2
+        return 64
+    fi
+    (( timeout_seconds >= 30 && timeout_seconds <= 7200 )) \
+        || { echo "Readiness timeout must be between 30 and 7200 seconds." >&2; return 64; }
+    local deadline=$((SECONDS + timeout_seconds))
+    acquire_lifecycle_lock_wait "${timeout_seconds}" || return
+    local remaining=$((deadline - SECONDS))
+    (( remaining > 0 )) \
+        || { echo "Lifecycle lock consumed the readiness timeout." >&2; return 1; }
+    "${WATCHDOG}" wait-ready --timeout "${remaining}" || return 1
+    verify_watchdog_active || return 1
+    accept_game_release 120
+}
+
 verify_deployment_ready() {
     local watchdog_version="$1"
     local ready=false
@@ -405,7 +516,8 @@ verify_deployment_ready() {
         "${WATCHDOG}" wait-ready --timeout "${DEPLOY_READY_TIMEOUT_SECONDS}" && ready=true
     fi
     [[ "${ready}" == true ]] || return 1
-    verify_watchdog_active
+    verify_watchdog_active || return 1
+    accept_game_release 120 >/dev/null
 }
 
 quiesce_for_deployment() {
@@ -692,8 +804,21 @@ start_stack() {
             systemctl start pz-watchdog.service
             ;;
         clean-stopped|missing)
-            systemctl restart pz-stack.service
-            systemctl restart pz-watchdog.service
+            local start_authorized=false
+            if authorize_deployment_start false; then
+                start_authorized=true
+            fi
+            if [[ "${start_authorized}" != true ]] \
+                || ! systemctl restart pz-stack.service \
+                || ! systemctl restart pz-watchdog.service; then
+                revoke_deployment_start || true
+                echo "Could not start Project Zomboid under lifecycle authorization." >&2
+                return 1
+            fi
+            if ! revoke_deployment_start; then
+                echo "Could not revoke lifecycle start authorization." >&2
+                return 1
+            fi
             ;;
         *)
             echo "Container state is unknown or unclean; refusing to start over it." >&2
@@ -703,6 +828,35 @@ start_stack() {
     [[ "$(compose_server_state)" == running ]] \
         || { echo "pz-stack.service did not start the server container." >&2; return 1; }
     verify_watchdog_active
+}
+
+game_update() {
+    local -a updater_arguments=(update)
+    if (( $# == 1 )) && [[ "$1" == --validate ]]; then
+        updater_arguments+=(--validate)
+    elif (( $# != 0 )); then
+        echo "Usage: pzctl update [--validate]" >&2
+        return 64
+    fi
+    [[ ! -e "${PENDING_DEPLOYMENT_FILE}" ]] \
+        || { echo "Repository deployment is pending; game update refused." >&2; return 1; }
+
+    quiesce_for_deployment current || return 1
+    local update_succeeded=true
+    if ! "${COMPOSE[@]}" run --rm --no-deps --entrypoint pz-updater \
+        server "${updater_arguments[@]}"; then
+        update_succeeded=false
+        echo "Game update failed before startup; restoring the selected known-good release." >&2
+    fi
+    if ! start_stack; then
+        echo "Project Zomboid could not restart after the game update transaction." >&2
+        return 1
+    fi
+    if ! wait_ready --timeout "${GAME_READY_TIMEOUT_SECONDS}"; then
+        echo "Project Zomboid restarted but game release acceptance failed." >&2
+        return 1
+    fi
+    [[ "${update_succeeded}" == true ]]
 }
 
 main() {
@@ -729,13 +883,17 @@ main() {
             graceful_stop "$@"
             start_stack
             ;;
+        update)
+            acquire_lifecycle_lock
+            game_update "$@"
+            ;;
         shutdown-host)
             acquire_lifecycle_lock
             shutdown_host "$@"
             ;;
         status) exec "${WATCHDOG}" status "$@" ;;
         players) exec "${WATCHDOG}" players "$@" ;;
-        wait-ready) exec "${WATCHDOG}" wait-ready "$@" ;;
+        wait-ready) wait_ready "$@" ;;
         logs) exec "${COMPOSE[@]}" logs --follow server ;;
         help|-h|--help) usage ;;
         *) usage >&2; exit 64 ;;

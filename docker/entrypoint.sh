@@ -3,8 +3,9 @@ set -Eeuo pipefail
 
 readonly CONSOLE_FIFO=/tmp/pz-console
 readonly PID_FILE=/tmp/pz-entrypoint.pid
-readonly VERIFIED_START_SCRIPT_SHA256=9bfcb6a6367e4a6e833680ce09a373ee8ac930f1bd6fb1d8085bbe20cb725957
 server_pid=""
+readiness_pid=""
+selected_release=""
 shutdown_requested=false
 shutdown_failed=false
 
@@ -64,8 +65,14 @@ validate_environment() {
     : "${DIRECT_PORT:=16262}"
     : "${RCON_PORT:=27015}"
     : "${STEAM_APP_ID:=380870}"
+    : "${PZ_UPDATE_POLICY:=}"
+    : "${ALLOW_AUTO_UPDATE_WITH_MODS:=false}"
+    : "${PZ_PRE_UPDATE_BACKUP_RETENTION:=3}"
+    : "${PZ_BACKUP_DIR:=/backups}"
     : "${UPDATE_ON_START:=false}"
     : "${STEAM_VALIDATE:=false}"
+    : "${UPDATE_READINESS_TIMEOUT_SECONDS:=1800}"
+    : "${DEPLOYMENT_ENVIRONMENT:=local}"
     : "${PZ_XMS:=2g}"
     : "${PZ_XMX:=8g}"
     : "${CONTAINER_MEMORY_LIMIT:=10g}"
@@ -93,12 +100,26 @@ validate_environment() {
     require_integer DIRECT_PORT 1024 65535
     require_integer RCON_PORT 1024 65535
     require_integer STEAM_APP_ID 1 2147483647
+    require_integer PZ_PRE_UPDATE_BACKUP_RETENTION 2 20
+    require_integer UPDATE_READINESS_TIMEOUT_SECONDS 30 7200
     require_integer SHUTDOWN_SAVE_SECONDS 0 30
     require_integer SHUTDOWN_GRACE_SECONDS 30 90
     [[ "${GAME_PORT}" != "${DIRECT_PORT}" ]] || die "GAME_PORT and DIRECT_PORT must differ."
     [[ "${RCON_PORT}" != "${GAME_PORT}" && "${RCON_PORT}" != "${DIRECT_PORT}" ]] || die "RCON_PORT must differ from gameplay ports."
     (( SHUTDOWN_SAVE_SECONDS + SHUTDOWN_GRACE_SECONDS <= 110 )) \
         || die "SHUTDOWN_SAVE_SECONDS plus SHUTDOWN_GRACE_SECONDS must not exceed 110."
+    [[ "${STEAM_APP_ID}" == 380870 ]] || die "Only dedicated-server Steam App 380870 is supported."
+    case "${PZ_UPDATE_POLICY}" in
+        ""|stable-on-start|manual) ;;
+        *) die "PZ_UPDATE_POLICY must be stable-on-start or manual." ;;
+    esac
+    [[ "${DEPLOYMENT_ENVIRONMENT}" == local || "${DEPLOYMENT_ENVIRONMENT}" == aws ]] \
+        || die "DEPLOYMENT_ENVIRONMENT must be local or aws."
+    is_true "${ALLOW_AUTO_UPDATE_WITH_MODS}" || true
+    is_true "${UPDATE_ON_START}" || true
+    if is_true "${STEAM_VALIDATE}"; then
+        die "STEAM_VALIDATE is no longer automatic; use the explicit pzctl update --validate repair path."
+    fi
 
     require_secret ADMIN_PASSWORD
     require_secret RCON_PASSWORD
@@ -107,38 +128,23 @@ validate_environment() {
 }
 
 prepare_directories() {
-    mkdir --parents "${PZ_SERVER_DIR}" "${ZOMBOID_DIR}/Server" "${ZOMBOID_DIR}/Saves" "${ZOMBOID_DIR}/Logs" "${ZOMBOID_DIR}/db" "${ZOMBOID_DIR}/mods"
+    mkdir --parents "${PZ_SERVER_DIR}" "${PZ_BACKUP_DIR}" "${ZOMBOID_DIR}/Server" "${ZOMBOID_DIR}/Saves" "${ZOMBOID_DIR}/Logs" "${ZOMBOID_DIR}/db" "${ZOMBOID_DIR}/mods"
     [[ -w "${PZ_SERVER_DIR}" ]] || die "${PZ_SERVER_DIR} is not writable by UID $(id -u). Fix host ownership."
     [[ -w "${ZOMBOID_DIR}" ]] || die "${ZOMBOID_DIR} is not writable by UID $(id -u). Fix host ownership."
+    [[ -w "${PZ_BACKUP_DIR}" ]] || die "${PZ_BACKUP_DIR} is not writable by UID $(id -u). Fix host ownership."
 }
 
-install_or_update_server() {
-    if ! is_true "${UPDATE_ON_START}" && [[ -x "${PZ_SERVER_DIR}/start-server.sh" ]]; then
-        log INFO "Skipping SteamCMD update because UPDATE_ON_START=false."
-        return
-    fi
-
-    local -a command=(
-        "${STEAMCMD_DIR}/steamcmd.sh"
-        +force_install_dir "${PZ_SERVER_DIR}"
-        +login anonymous
-        +app_update "${STEAM_APP_ID}"
-    )
-
-    if [[ -n "${STEAM_BRANCH:-}" && "${STEAM_BRANCH,,}" != "stable" ]]; then
-        command+=(-beta "${STEAM_BRANCH}")
-        if [[ -n "${STEAM_BRANCH_PASSWORD:-}" ]]; then
-            command+=(-betapassword "${STEAM_BRANCH_PASSWORD}")
-        fi
-    fi
-    if is_true "${STEAM_VALIDATE}"; then
-        command+=(validate)
-    fi
-    command+=(+quit)
-
-    log INFO "Installing/updating Project Zomboid dedicated server App ${STEAM_APP_ID}, branch '${STEAM_BRANCH:-stable}'."
-    "${command[@]}" || die "SteamCMD failed; persistent data was not removed."
-    [[ -x "${PZ_SERVER_DIR}/start-server.sh" ]] || die "SteamCMD completed but start-server.sh is missing."
+prepare_release() {
+    selected_release="$(pz-updater prepare-start)" \
+        || die "Project Zomboid release preparation failed; the world was not started."
+    [[ -n "${selected_release}" && "${selected_release}" != *$'\n'* ]] \
+        || die "Updater returned an ambiguous active release path."
+    case "${selected_release}" in
+        "${PZ_SERVER_DIR}"|"${PZ_SERVER_DIR}"/releases/*) ;;
+        *) die "Updater selected a release outside ${PZ_SERVER_DIR}." ;;
+    esac
+    [[ -x "${selected_release}/.pz-start-server.sh" ]] \
+        || die "Selected release has no executable managed start wrapper."
 }
 
 merge_managed_ini() {
@@ -203,54 +209,6 @@ render_configuration() {
     log INFO "Merged managed settings into ${destination}; generated identity and unmanaged settings were preserved."
 }
 
-prepare_launcher_configuration() {
-    local source="${PZ_SERVER_DIR}/ProjectZomboid64.json"
-    local generated
-    local xms_count xmx_count
-    [[ -f "${source}" ]] || die "Missing current Build 42 launcher configuration: ${source}"
-    xms_count="$(grep --extended-regexp --count -- '"-Xms[0-9]+[gGmM]"' "${source}" || true)"
-    xmx_count="$(grep --extended-regexp --count -- '"-Xmx[0-9]+[gGmM]"' "${source}" || true)"
-    [[ "${xmx_count}" == 1 && "${xms_count}" -le 1 ]] || die "Upstream ProjectZomboid64.json memory flags changed; refusing an unverified JVM allocation."
-    generated="$(mktemp "${PZ_SERVER_DIR}/.ProjectZomboid64.json.XXXXXX")"
-
-    if [[ "${xms_count}" == 1 ]]; then
-        sed --regexp-extended \
-            -e "s/\"-Xms[0-9]+[gGmM]\"/\"-Xms${PZ_XMS}\"/" \
-            -e "s/\"-Xmx[0-9]+[gGmM]\"/\"-Xmx${PZ_XMX}\"/" \
-            "${source}" > "${generated}"
-    else
-        sed --regexp-extended \
-            -e "s/^([[:space:]]*)\"-Xmx[0-9]+[gGmM]\",/\1\"-Xms${PZ_XMS}\",\n\1\"-Xmx${PZ_XMX}\",/" \
-            "${source}" > "${generated}"
-    fi
-    jq empty "${generated}" >/dev/null || die "Managed launcher configuration is not valid JSON."
-    chmod --reference="${source}" "${generated}"
-    mv "${generated}" "${source}"
-    log INFO "Configured current Build 42 launcher heap as ${PZ_XMS}-${PZ_XMX}."
-}
-
-prepare_start_script() {
-    local source="${PZ_SERVER_DIR}/start-server.sh"
-    local destination="${PZ_SERVER_DIR}/.pz-start-server.sh"
-    local generated checksum
-    [[ -f "${source}" ]] || die "Missing current Build 42 start script: ${source}"
-    checksum="$(sha256sum "${source}" | cut --delimiter=' ' --fields=1)"
-    [[ "${checksum}" == "${VERIFIED_START_SCRIPT_SHA256}" ]] \
-        || die "Upstream start-server.sh changed; refusing an unreviewed process-status wrapper."
-    generated="$(mktemp "${PZ_SERVER_DIR}/.pz-start-server.sh.XXXXXX")"
-    if ! sed \
-        -e 's/^[[:space:]]*echo "Only 64bit is supported"$/\techo "Only 64bit is supported" >\&2; exit 1/' \
-        -e 's/^exit 0$/exit $?/' \
-        "${source}" > "${generated}"; then
-        rm -f -- "${generated}"
-        die "Could not generate the verified process-status wrapper."
-    fi
-    if ! chmod --reference="${source}" "${generated}" || ! mv "${generated}" "${destination}"; then
-        rm -f -- "${generated}"
-        die "Could not install the verified process-status wrapper."
-    fi
-}
-
 request_shutdown() {
     shutdown_requested=true
     trap - SIGTERM SIGINT
@@ -292,7 +250,10 @@ graceful_shutdown() {
 }
 
 run_server() {
-    local start_script="$1"
+    local release="$1"
+    local start_script="${release}/.pz-start-server.sh"
+    local runtime_log="${ZOMBOID_DIR}/server-console.txt"
+    local log_fingerprint
     local -a arguments=(-servername "${PZ_SERVER_NAME}")
     local database="${ZOMBOID_DIR}/db/${PZ_SERVER_NAME}.db"
 
@@ -307,10 +268,20 @@ run_server() {
     trap request_shutdown SIGTERM SIGINT
 
     log INFO "Starting Project Zomboid '${PZ_SERVER_NAME}' with heap ${PZ_XMS}-${PZ_XMX}. PauseEmpty is managed as true."
-    cd "${PZ_SERVER_DIR}"
+    log_fingerprint="$(pz-updater log-fingerprint --log "${runtime_log}")" \
+        || die "Could not fingerprint the Project Zomboid runtime log."
+    pz-updater mark-world-opened >/dev/null \
+        || die "Could not record the candidate world-open boundary."
+    cd "${release}"
     setsid bash "${start_script}" "${arguments[@]}" <&3 &
     server_pid=$!
     printf '%s\n' "${server_pid}" > "${PID_FILE}"
+    pz-updater wait-runtime-ready \
+        --pid "${server_pid}" \
+        --log "${runtime_log}" \
+        --log-fingerprint "${log_fingerprint}" \
+        --timeout "${UPDATE_READINESS_TIMEOUT_SECONDS}" &
+    readiness_pid=$!
 
     local status=0 final_status
     wait "${server_pid}" || status=$?
@@ -322,6 +293,15 @@ run_server() {
         if (( final_status != 127 )); then
             status="${final_status}"
         fi
+    fi
+    if [[ -n "${readiness_pid}" ]]; then
+        if [[ "${shutdown_requested}" == true ]]; then
+            kill -TERM "${readiness_pid}" 2>/dev/null || true
+            wait "${readiness_pid}" 2>/dev/null || true
+        elif ! wait "${readiness_pid}"; then
+            log ERROR "Runtime readiness was not accepted; inspect pz-updater status before recovery."
+        fi
+        readiness_pid=""
     fi
     rm -f "${PID_FILE}" "${CONSOLE_FIFO}"
     exec 3>&-
@@ -346,11 +326,9 @@ run_server() {
 main() {
     validate_environment
     prepare_directories
-    install_or_update_server
     render_configuration
-    prepare_launcher_configuration
-    prepare_start_script
-    run_server "${PZ_SERVER_DIR}/.pz-start-server.sh"
+    prepare_release
+    run_server "${selected_release}"
 }
 
 main "$@"

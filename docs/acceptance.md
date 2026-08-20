@@ -5,7 +5,7 @@ Run this checklist before the first AWS apply and after changes to Docker, PZ co
 ## Prerequisites
 
 - Docker Desktop is running with enough memory for `.env` limits.
-- `.env` exists, all `change-me-*` values were replaced, and `UPDATE_ON_START=false` after the initial download.
+- `.env` exists, all `change-me-*` values were replaced, `PZ_UPDATE_POLICY` is intentionally `stable-on-start` or `manual`, and the pre-update backup/deployment-state bind directories exist.
 - A matching stable Project Zomboid client is available for player/persistence checks.
 - No irreplaceable local world is used without a backup.
 
@@ -18,7 +18,7 @@ docker compose ps
 docker compose logs --tail 200 server
 ```
 
-Wait until `docker compose ps` reports `healthy`. Confirm logs show the intended stable branch, managed `PauseEmpty=true`, the configured `4g-8g` or local test heap, and successful server startup. Do not treat an open port alone as readiness.
+Wait until `docker compose ps` reports `healthy`. Confirm logs show current/latest Steam build IDs or an explicit manual/mod block, managed `PauseEmpty=true`, the configured `4g-8g` or local test heap, exact RCON readiness, and successful server startup. Do not treat an open port alone as readiness.
 
 Verify both memory boundaries fail before SteamCMD or Java starts:
 
@@ -37,6 +37,38 @@ if ($limitExit -eq 0 -or ($limitOutput -join "`n") -notmatch 'PZ_XMX must remain
   throw 'The intended XMX limit validation did not reject startup before installation'
 }
 ```
+
+## Updater State and Fault Simulation
+
+The automated updater suite uses temporary releases and a fake Steam provider. It is a simulation of cross-version activation, not evidence that a real PZ client can load a future Stable world:
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest updater\tests -q
+```
+
+Require coverage for all of these cases:
+
+- Public App `380870` metadata and complete-manifest parsing; duplicate/missing fields fail closed.
+- Legacy flat-install inspection before migration and repository-pending suppression before any move.
+- No-update startup without backup/download, mod-blocked automatic policy, explicit retry of a rejected build, and downgrade refusal.
+- Isolated candidate rejection, interrupted download/promotion/activation cleanup, insufficient/failed backup behavior, and unchanged active pointer before world access.
+- Verified archive/checksum/retention behavior with at least two completed pre-update backups.
+- Correct `previous_build`/candidate accounting, local and AWS readiness/acceptance, and pointer/manifest mismatch rejection.
+- `failed-after-world-open` retaining the candidate with no automatic downgrade.
+
+With `PZ_UPDATE_POLICY=stable-on-start`, recreate a real current-Stable server when no update is pending:
+
+```powershell
+docker compose up -d --force-recreate server
+docker compose logs --tail 300 server
+docker compose exec -T server pz-updater status
+```
+
+Require the installed/current build to equal the queried public build, `last_result=no-update`, exact RCON readiness, and unchanged world data. At the 2026-08-20 source check, public App `380870` build `24775771` described Stable `42.20.3`; re-query rather than hard-coding that value into logic.
+
+Set `PZ_UPDATE_POLICY=manual`, recreate the container, and require `last_result=manual-policy` with no Steam metadata query. Configure a disposable `MODS` value under `stable-on-start` and require `last_result=blocked-mods`; never test an incompatible mod against the only world copy.
+
+When Valve actually publishes a newer public build, use a backed-up disposable copy first. Require a `pz-pre-update-<old>-to-<new>-*.tar.gz` archive and matching sidecars before `active-release` changes, then test exact RCON, save, clean stop, restart, world identity, and gameplay with a matching real client. Record this separately as a real cross-version acceptance; the fixture suite is not a substitute.
 
 ## Real RCON
 
@@ -143,7 +175,7 @@ docker compose --profile watchdog up -d watchdog
 
 ## Unexpected Exit Propagation
 
-Run this destructive check only against a disposable local world after confirming zero players and a successful save. It proves the checksum-gated Build 42 launcher wrapper does not restore upstream's masked exit code `0` behavior:
+Run this destructive check only against a disposable local world after confirming zero players and a successful save. It proves the structurally validated Build 42 launcher wrapper does not restore upstream's masked exit code `0` behavior:
 
 ```powershell
 docker compose --profile watchdog stop watchdog
@@ -175,4 +207,4 @@ terraform -chdir=terraform init -backend=false -input=false
 terraform -chdir=terraform validate
 ```
 
-Also run ShellCheck on all `*.sh` files and parse every `scripts/windows/*.ps1` file. These checks intentionally do not run `terraform plan` against an account, `terraform apply`, SSM, systemd, EBS attach/resize, EC2 protection/replacement, or AWS Budget delivery. Validate those only in a reviewed AWS maintenance window.
+Also run ShellCheck on all `*.sh` files and parse every `scripts/windows/*.ps1` file. Verify the game image can execute `pz-updater --help`, and run a no-download managed-release smoke test in the built image. These checks intentionally do not run `terraform plan` against an account, `terraform apply`, SSM, systemd, EBS attach/resize, EC2 protection/replacement, or AWS Budget delivery. Validate those only in a reviewed AWS maintenance window.

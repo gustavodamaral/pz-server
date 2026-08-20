@@ -80,6 +80,9 @@ class Settings:
     compose_env_file: Path | None
     compose_service: str
     data_path: Path
+    server_path: Path
+    update_policy: str
+    steam_branch: str
     rcon_cli_command: tuple[str, ...]
 
     @classmethod
@@ -127,6 +130,23 @@ class Settings:
         if not password or password.startswith("change-me-"):
             raise ConfigurationError("RCON_PASSWORD must be set to a non-placeholder value")
 
+        update_policy = values.get("PZ_UPDATE_POLICY", "").strip()
+        if not update_policy:
+            update_policy = (
+                "stable-on-start"
+                if _boolean(values, "UPDATE_ON_START", False)
+                else "manual"
+                if "UPDATE_ON_START" in values
+                else "stable-on-start"
+            )
+        if update_policy not in {"stable-on-start", "manual"}:
+            raise ConfigurationError("PZ_UPDATE_POLICY must be stable-on-start or manual")
+        steam_branch = values.get("STEAM_BRANCH", "").strip()
+        if update_policy == "stable-on-start" and steam_branch:
+            raise ConfigurationError(
+                "PZ_UPDATE_POLICY=stable-on-start requires an empty STEAM_BRANCH"
+            )
+
         return cls(
             rcon_host=values.get("RCON_HOST", "127.0.0.1"),
             rcon_port=_integer(values, "RCON_PORT", 27015, 1024, 65535),
@@ -156,5 +176,13 @@ class Settings:
             compose_env_file=compose_env_file,
             compose_service=values.get("COMPOSE_SERVICE", "server"),
             data_path=Path(values.get("PZ_DATA_PATH", "./runtime/zomboid")).resolve(),
+            server_path=Path(
+                values.get(
+                    "PZ_STATUS_SERVER_PATH",
+                    values.get("PZ_SERVER_PATH", "./runtime/server"),
+                )
+            ).resolve(),
+            update_policy=update_policy,
+            steam_branch=steam_branch or "public",
             rcon_cli_command=rcon_cli_command,
         )

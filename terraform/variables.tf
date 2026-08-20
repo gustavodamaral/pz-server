@@ -113,9 +113,9 @@ variable "party_instance_type" {
 }
 
 variable "root_volume_size_gib" {
-  description = "Disposable encrypted root volume size in GiB."
+  description = "Disposable encrypted root volume size in GiB, including isolated Steam release headroom."
   type        = number
-  default     = 24
+  default     = 32
 
   validation {
     condition     = var.root_volume_size_gib >= 16 && var.root_volume_size_gib <= 200
