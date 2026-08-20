@@ -3,6 +3,7 @@ set -Eeuo pipefail
 
 readonly CONSOLE_FIFO=/tmp/pz-console
 readonly PID_FILE=/tmp/pz-entrypoint.pid
+readonly VERIFIED_START_SCRIPT_SHA256=9bfcb6a6367e4a6e833680ce09a373ee8ac930f1bd6fb1d8085bbe20cb725957
 server_pid=""
 shutdown_requested=false
 shutdown_failed=false
@@ -54,6 +55,7 @@ memory_mib() {
 }
 
 validate_environment() {
+    local container_limit_mib xms_mib xmx_mib
     : "${PZ_SERVER_NAME:=pzserver}"
     : "${SERVER_PUBLIC_NAME:=Friends Project Zomboid Build 42}"
     : "${ADMIN_USERNAME:=admin}"
@@ -66,9 +68,9 @@ validate_environment() {
     : "${STEAM_VALIDATE:=false}"
     : "${PZ_XMS:=2g}"
     : "${PZ_XMX:=8g}"
+    : "${CONTAINER_MEMORY_LIMIT:=10g}"
     : "${SHUTDOWN_SAVE_SECONDS:=15}"
     : "${SHUTDOWN_GRACE_SECONDS:=90}"
-    : "${STATISTICS_PERIOD:=0}"
     : "${MODS:=}"
     : "${WORKSHOP_ITEMS:=}"
     : "${MAP_NAMES:=Muldraugh, KY}"
@@ -77,7 +79,14 @@ validate_environment() {
     [[ "${ADMIN_USERNAME}" =~ ^[A-Za-z0-9_-]+$ ]] || die "ADMIN_USERNAME may contain only letters, numbers, underscores, and hyphens."
     [[ "${PZ_XMS}" =~ ^[1-9][0-9]*[gGmM]$ ]] || die "PZ_XMS must look like 2g or 2048m."
     [[ "${PZ_XMX}" =~ ^[1-9][0-9]*[gGmM]$ ]] || die "PZ_XMX must look like 8g or 8192m."
-    (( $(memory_mib "${PZ_XMS}") <= $(memory_mib "${PZ_XMX}") )) || die "PZ_XMS must not exceed PZ_XMX."
+    [[ "${CONTAINER_MEMORY_LIMIT}" =~ ^[1-9][0-9]*[gGmM]$ ]] \
+        || die "CONTAINER_MEMORY_LIMIT must look like 10g or 10240m."
+    xms_mib="$(memory_mib "${PZ_XMS}")"
+    xmx_mib="$(memory_mib "${PZ_XMX}")"
+    container_limit_mib="$(memory_mib "${CONTAINER_MEMORY_LIMIT}")"
+    (( xms_mib <= xmx_mib )) || die "PZ_XMS must not exceed PZ_XMX."
+    (( xmx_mib < container_limit_mib )) \
+        || die "PZ_XMX must remain below CONTAINER_MEMORY_LIMIT for native/off-heap memory."
 
     require_integer MAX_PLAYERS 1 100
     require_integer GAME_PORT 1024 65535
@@ -86,7 +95,6 @@ validate_environment() {
     require_integer STEAM_APP_ID 1 2147483647
     require_integer SHUTDOWN_SAVE_SECONDS 0 30
     require_integer SHUTDOWN_GRACE_SECONDS 30 90
-    require_integer STATISTICS_PERIOD 0 3600
     [[ "${GAME_PORT}" != "${DIRECT_PORT}" ]] || die "GAME_PORT and DIRECT_PORT must differ."
     [[ "${RCON_PORT}" != "${GAME_PORT}" && "${RCON_PORT}" != "${DIRECT_PORT}" ]] || die "RCON_PORT must differ from gameplay ports."
     (( SHUTDOWN_SAVE_SECONDS + SHUTDOWN_GRACE_SECONDS <= 110 )) \
@@ -99,7 +107,7 @@ validate_environment() {
 }
 
 prepare_directories() {
-    mkdir --parents "${PZ_SERVER_DIR}" "${ZOMBOID_DIR}/Server" "${ZOMBOID_DIR}/Saves" "${ZOMBOID_DIR}/Logs" "${ZOMBOID_DIR}/db"
+    mkdir --parents "${PZ_SERVER_DIR}" "${ZOMBOID_DIR}/Server" "${ZOMBOID_DIR}/Saves" "${ZOMBOID_DIR}/Logs" "${ZOMBOID_DIR}/db" "${ZOMBOID_DIR}/mods"
     [[ -w "${PZ_SERVER_DIR}" ]] || die "${PZ_SERVER_DIR} is not writable by UID $(id -u). Fix host ownership."
     [[ -w "${ZOMBOID_DIR}" ]] || die "${ZOMBOID_DIR} is not writable by UID $(id -u). Fix host ownership."
 }
@@ -221,6 +229,28 @@ prepare_launcher_configuration() {
     log INFO "Configured current Build 42 launcher heap as ${PZ_XMS}-${PZ_XMX}."
 }
 
+prepare_start_script() {
+    local source="${PZ_SERVER_DIR}/start-server.sh"
+    local destination="${PZ_SERVER_DIR}/.pz-start-server.sh"
+    local generated checksum
+    [[ -f "${source}" ]] || die "Missing current Build 42 start script: ${source}"
+    checksum="$(sha256sum "${source}" | cut --delimiter=' ' --fields=1)"
+    [[ "${checksum}" == "${VERIFIED_START_SCRIPT_SHA256}" ]] \
+        || die "Upstream start-server.sh changed; refusing an unreviewed process-status wrapper."
+    generated="$(mktemp "${PZ_SERVER_DIR}/.pz-start-server.sh.XXXXXX")"
+    if ! sed \
+        -e 's/^[[:space:]]*echo "Only 64bit is supported"$/\techo "Only 64bit is supported" >\&2; exit 1/' \
+        -e 's/^exit 0$/exit $?/' \
+        "${source}" > "${generated}"; then
+        rm -f -- "${generated}"
+        die "Could not generate the verified process-status wrapper."
+    fi
+    if ! chmod --reference="${source}" "${generated}" || ! mv "${generated}" "${destination}"; then
+        rm -f -- "${generated}"
+        die "Could not install the verified process-status wrapper."
+    fi
+}
+
 request_shutdown() {
     shutdown_requested=true
     trap - SIGTERM SIGINT
@@ -263,7 +293,7 @@ graceful_shutdown() {
 
 run_server() {
     local start_script="$1"
-    local -a arguments=(-servername "${PZ_SERVER_NAME}" -statistic "${STATISTICS_PERIOD}")
+    local -a arguments=(-servername "${PZ_SERVER_NAME}")
     local database="${ZOMBOID_DIR}/db/${PZ_SERVER_NAME}.db"
 
     if [[ ! -s "${database}" ]]; then
@@ -319,7 +349,8 @@ main() {
     install_or_update_server
     render_configuration
     prepare_launcher_configuration
-    run_server "${PZ_SERVER_DIR}/start-server.sh"
+    prepare_start_script
+    run_server "${PZ_SERVER_DIR}/.pz-start-server.sh"
 }
 
 main "$@"

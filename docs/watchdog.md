@@ -72,4 +72,4 @@ EC2 has `instance_initiated_shutdown_behavior = "stop"`, so Linux poweroff stops
 
 Safety-core coverage includes active/empty transitions, timeout boundaries, reconnects, transient and exhausted RCON errors, warning/duplicate/ambiguous zero-exit output, unknown reset, healthy versus unhealthy secondary state, sustained outage restart, restart failure, recovery, pre/post-save reconnect/error, dry run, eligibility, exact save confirmation, single-container clean-exit verification, inspection failure, poweroff initiation failure, and service recovery.
 
-Use shortened values only in local `.env` for an interactive dry-run test. Never arm AWS effects merely to accelerate testing.
+Use process-level shortened values only for an interactive local dry-run test. Never arm AWS effects merely to accelerate testing. The exact real-server empty/player/unavailable RCON, timeout, persistence, and signal procedure is in [the local acceptance checklist](acceptance.md).

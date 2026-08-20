@@ -77,7 +77,7 @@ sudo docker compose --project-directory /opt/pz-stack --env-file /srv/pz/secrets
 
 If `/opt/pz-stack` is absent, verify the Git URL is public and the exact configured commit SHA was pushed. If `/srv/pz` is not mounted, compare `lsblk -o NAME,SERIAL,FSTYPE,MOUNTPOINTS` with Terraform's persistent volume ID. `No filesystem was detected` is intentionally fatal unless this is the first blank volume and one-time initialization was explicitly armed. Never enable formatting or run `mkfs` to repair an existing/damaged volume; snapshot it and diagnose first.
 
-Bootstrap and stack-readiness failures intentionally leave EC2 online because player/save state is unknown. Diagnose through SSM, inspect Docker state, and stop through `Stop-PZ.ps1` only when its guarded path succeeds. If cloud-init's once-only command failed, rerun `/usr/local/sbin/pz-first-boot` only after correcting the cause, or replace the disposable instance through a reviewed Terraform plan. Use a Billing alarm to detect forgotten failed hosts.
+Bootstrap and stack-readiness failures intentionally leave EC2 online because player/save state is unknown. Diagnose through SSM, inspect Docker state, and stop through `Stop-PZ.ps1` only when its guarded path succeeds. If cloud-init's once-only command failed, rerun `/usr/local/sbin/pz-first-boot` only after correcting the cause, or replace the disposable instance through a reviewed Terraform plan. Successful volume mounting consumes host-local format authorization before any later rerun. Enable the optional AWS Budget to detect forgotten failed hosts.
 
 ## SSM Is Offline
 

@@ -111,6 +111,14 @@ mount_data_volume() {
         mount "${DATA_MOUNT}"
     fi
     mountpoint --quiet "${DATA_MOUNT}" || die "Persistent data mount verification failed."
+    if [[ "${INITIALIZE_DATA_VOLUME}" == true ]]; then
+        sed --in-place \
+            's/^INITIALIZE_DATA_VOLUME=true$/INITIALIZE_DATA_VOLUME=false/' \
+            "${BOOTSTRAP_ENV}"
+        grep --quiet --fixed-strings 'INITIALIZE_DATA_VOLUME=false' "${BOOTSTRAP_ENV}" \
+            || die "Could not consume the one-time data-volume initialization authorization."
+        log INFO "Consumed the host-local data-volume initialization authorization."
+    fi
     install -d -m 0750 "${DATA_MOUNT}/data" "${DATA_MOUNT}/backups"
     chown -R 1000:1000 "${DATA_MOUNT}/data"
 }
@@ -125,7 +133,11 @@ deploy_repository() {
     git -C "${PROJECT_DIRECTORY}" checkout --detach --force FETCH_HEAD
     [[ "$(git -C "${PROJECT_DIRECTORY}" rev-parse HEAD)" == "${REPOSITORY_REF,,}" ]] \
         || die "Checked-out repository commit does not match the requested immutable SHA."
-    PZ_DATA_ROOT="${DATA_MOUNT}" "${PROJECT_DIRECTORY}/scripts/linux/install-host.sh"
+    PZ_DATA_ROOT="${DATA_MOUNT}" bash "${PROJECT_DIRECTORY}/scripts/linux/install-host.sh"
+    install -d -m 0700 /var/lib/pz-deploy
+    printf '%s\n' "${REPOSITORY_REF,,}" > /var/lib/pz-deploy/deployed-commit.tmp
+    chmod 0600 /var/lib/pz-deploy/deployed-commit.tmp
+    mv /var/lib/pz-deploy/deployed-commit.tmp /var/lib/pz-deploy/deployed-commit
 }
 
 main() {

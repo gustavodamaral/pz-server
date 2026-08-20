@@ -15,6 +15,16 @@ resource "aws_ebs_volume" "world" {
 
   lifecycle {
     prevent_destroy = true
+
+    precondition {
+      condition     = local.availability_zone_is_compatible
+      error_message = local.availability_zone_error
+    }
+
+    precondition {
+      condition     = local.subnet_is_within_vpc
+      error_message = local.subnet_vpc_error
+    }
   }
 }
 

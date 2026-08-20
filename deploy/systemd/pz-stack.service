@@ -18,6 +18,7 @@ ExecStop=/usr/bin/docker compose --project-directory /opt/pz-stack --file /opt/p
 TimeoutStartSec=15min
 TimeoutStopSec=3min
 UMask=0077
+ExecCondition=/usr/local/sbin/pz-deployment-unit-guard
 
 [Install]
 WantedBy=multi-user.target

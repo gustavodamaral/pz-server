@@ -8,6 +8,11 @@ normal_instance_type = "r7a.large"
 party_instance_type  = "m7a.xlarge"
 data_volume_size_gib = 40
 
+# EC2 API termination protection always remains enabled. True persists one-time
+# provider deletion authorization only in the separately planned procedure in
+# docs/aws.md; the replacement plan itself must set this back to false.
+allow_instance_replacement = false
+
 # Keep false for existing volumes and snapshot restores. For a brand-new blank
 # volume only, set true for the initial apply, then immediately restore false
 # and apply again so replacement hosts can never format it.
@@ -18,3 +23,10 @@ allowed_game_cidrs = ["0.0.0.0/0"]
 
 repository_url = "https://github.com/gustavodamaral/pz-server.git"
 repository_ref = "REPLACE_WITH_THE_EXACT_40_CHARACTER_COMMIT_SHA"
+
+# Optional account-wide monthly cost backstop. Direct budget notifications are
+# free; no automated actions or SNS resources are created.
+enable_cost_alerts   = false
+billing_alert_email  = null
+billing_warning_usd  = 7
+billing_critical_usd = 10

@@ -29,10 +29,15 @@ variable "environment" {
     condition     = can(regex("^[a-z0-9][a-z0-9-]{1,30}[a-z0-9]$", var.environment))
     error_message = "environment must contain 3-32 lowercase letters, numbers, or hyphens."
   }
+
+  validation {
+    condition     = length(var.project_name) + length(var.environment) <= 59
+    error_message = "project_name and environment must total at most 59 characters so the derived IAM role name fits AWS's 64-character limit."
+  }
 }
 
 variable "availability_zone" {
-  description = "Optional fixed AZ. The persistent EBS volume and instance must remain in this AZ."
+  description = "Optional fixed AZ. It must offer both configured instance types; otherwise the first compatible AZ is selected deterministically."
   type        = string
   default     = null
   nullable    = true
@@ -44,8 +49,15 @@ variable "vpc_cidr" {
   default     = "10.42.0.0/16"
 
   validation {
-    condition     = can(cidrnetmask(var.vpc_cidr))
-    error_message = "vpc_cidr must be a valid IPv4 CIDR."
+    condition = try(
+      can(cidrnetmask(var.vpc_cidr)) &&
+      tonumber(split("/", var.vpc_cidr)[1]) >= 16 &&
+      tonumber(split("/", var.vpc_cidr)[1]) <= 28 &&
+      split("/", var.vpc_cidr)[0] == cidrhost(var.vpc_cidr, 0) &&
+      can(regex("^(10\\.|192\\.168\\.|172\\.(1[6-9]|2[0-9]|3[01])\\.)", cidrhost(var.vpc_cidr, 0))),
+      false
+    )
+    error_message = "vpc_cidr must be a canonical private RFC 1918 IPv4 CIDR with a /16 through /28 prefix."
   }
 }
 
@@ -55,9 +67,16 @@ variable "public_subnet_cidr" {
   default     = "10.42.1.0/24"
 
   validation {
-    condition     = can(cidrnetmask(var.public_subnet_cidr))
-    error_message = "public_subnet_cidr must be a valid IPv4 CIDR."
+    condition = try(
+      can(cidrnetmask(var.public_subnet_cidr)) &&
+      tonumber(split("/", var.public_subnet_cidr)[1]) >= 16 &&
+      tonumber(split("/", var.public_subnet_cidr)[1]) <= 28 &&
+      split("/", var.public_subnet_cidr)[0] == cidrhost(var.public_subnet_cidr, 0),
+      false
+    )
+    error_message = "public_subnet_cidr must be a canonical AWS IPv4 subnet CIDR with a /16 through /28 prefix."
   }
+
 }
 
 variable "allowed_game_cidrs" {
@@ -152,12 +171,63 @@ variable "repository_url" {
 }
 
 variable "repository_ref" {
-  description = "Exact 40-character Git commit SHA fetched during first-boot deployment."
+  description = "Exact 40-character Git commit SHA used only when bootstrapping a newly created EC2 host. Use Deploy-PZ.ps1 for routine deployments."
   type        = string
 
   validation {
     condition     = can(regex("^[0-9a-fA-F]{40}$", var.repository_ref))
     error_message = "repository_ref must be an immutable 40-character Git commit SHA."
+  }
+}
+
+variable "allow_instance_replacement" {
+  description = "Persist one-time provider authorization to remove EC2 termination protection from the current instance during its next deletion. Use only in the documented staged replacement workflow."
+  type        = bool
+  default     = false
+}
+
+variable "enable_cost_alerts" {
+  description = "Create a notification-only, account-wide monthly AWS cost budget. No automated budget actions are created."
+  type        = bool
+  default     = false
+}
+
+variable "billing_alert_email" {
+  description = "Direct email subscriber for AWS Budget alerts. Required when enable_cost_alerts is true."
+  type        = string
+  default     = null
+  nullable    = true
+
+  validation {
+    condition     = var.billing_alert_email == null || can(regex("^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$", var.billing_alert_email))
+    error_message = "billing_alert_email must be null or a valid email address."
+  }
+
+  validation {
+    condition     = !var.enable_cost_alerts || var.billing_alert_email != null
+    error_message = "billing_alert_email is required when enable_cost_alerts is true."
+  }
+}
+
+variable "billing_warning_usd" {
+  description = "Absolute monthly USD threshold for warning-level actual and forecast AWS Budget notifications."
+  type        = number
+  default     = 7
+
+  validation {
+    condition     = var.billing_warning_usd > 0
+    error_message = "billing_warning_usd must be greater than zero."
+  }
+}
+
+variable "billing_critical_usd" {
+  description = "Absolute monthly USD threshold and limit for critical actual and forecast AWS Budget notifications."
+  type        = number
+  default     = 10
+
+  validation {
+    condition     = var.billing_critical_usd > var.billing_warning_usd
+    error_message = "billing_critical_usd must be greater than billing_warning_usd."
   }
 }
 

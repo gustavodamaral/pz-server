@@ -16,10 +16,12 @@ resource "aws_instance" "server" {
   vpc_security_group_ids               = [aws_security_group.game_server.id]
   iam_instance_profile                 = aws_iam_instance_profile.server.name
   associate_public_ip_address          = true
+  disable_api_termination              = true
+  force_destroy                        = var.allow_instance_replacement
   instance_initiated_shutdown_behavior = "stop"
   monitoring                           = var.enable_detailed_monitoring
   user_data                            = local.cloud_config
-  user_data_replace_on_change          = true
+  user_data_replace_on_change          = false
 
   metadata_options {
     http_endpoint               = "enabled"
@@ -48,7 +50,22 @@ resource "aws_instance" "server" {
   lifecycle {
     # Start-PZ.ps1 can safely select Normal/Party while stopped. Terraform should
     # not undo that deliberate runtime choice on the next unrelated apply.
-    ignore_changes = [ami, instance_type]
+    # Cloud-init is creation-time bootstrap input. Routine application deployment
+    # uses pzctl through SSM and must never stop or replace this instance.
+    ignore_changes = [ami, instance_type, user_data]
+    replace_triggered_by = [
+      aws_ebs_volume.world.id,
+    ]
+
+    precondition {
+      condition     = local.availability_zone_is_compatible
+      error_message = local.availability_zone_error
+    }
+
+    precondition {
+      condition     = local.instance_types_support_ami
+      error_message = local.instance_type_ami_error
+    }
   }
 
   depends_on = [

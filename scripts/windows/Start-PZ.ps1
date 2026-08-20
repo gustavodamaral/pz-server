@@ -85,6 +85,7 @@ $commandId = Send-PZSsmCommand `
     -Region $Region `
     -Profile $Profile `
     -TimeoutSeconds ($bootstrapWaitSeconds + 60) `
+    -DeliveryTimeoutSeconds 120 `
     -Comment 'Wait for Project Zomboid readiness' `
     -Command $readyCommand
 $null = Wait-PZSsmCommand `
@@ -92,7 +93,7 @@ $null = Wait-PZSsmCommand `
     -InstanceId $instanceId `
     -Region $Region `
     -Profile $Profile `
-    -TimeoutSeconds ($bootstrapWaitSeconds + 120)
+    -TimeoutSeconds ($bootstrapWaitSeconds + 210)
 
 $instance = Get-PZInstance -Region $Region -Profile $Profile -ProjectTag $ProjectTag -EnvironmentTag $EnvironmentTag
 $publicIp = [string] $instance.PublicIpAddress

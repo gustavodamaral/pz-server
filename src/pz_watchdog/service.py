@@ -6,7 +6,7 @@ import socket
 import subprocess
 import time
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
 
@@ -38,6 +38,7 @@ class DockerComposeService:
     env_file: Path | None = None
     ready_timeout_seconds: int = 900
     sleeper: Callable[[float], None] = time.sleep
+    _verified_stopped_identifier: str | None = field(default=None, init=False, repr=False)
 
     @property
     def compose_command(self) -> list[str]:
@@ -149,6 +150,7 @@ class DockerComposeService:
         return True
 
     def graceful_stop(self, timeout_seconds: int) -> bool:
+        self._verified_stopped_identifier = None
         try:
             identifier = self.container_id()
         except ServiceInspectionError as error:
@@ -169,22 +171,55 @@ class DockerComposeService:
         except ServiceInspectionError as error:
             LOGGER.error("Could not verify the stopped container: %s", error)
             return False
-        clean_exit = (
-            state.get("Running") is False
-            and state.get("OOMKilled") is False
-            and state.get("ExitCode") == 0
-        )
+        clean_exit = self._is_clean_exit(state)
         if not clean_exit:
             LOGGER.error("The exact Project Zomboid container did not exit cleanly")
-        return clean_exit
+            return False
+        try:
+            current_identifier = self.container_id()
+        except ServiceInspectionError as error:
+            LOGGER.error("Could not reverify the stopped container identity: %s", error)
+            return False
+        if current_identifier != identifier:
+            LOGGER.error("The Project Zomboid container identity changed during shutdown")
+            return False
+        self._verified_stopped_identifier = identifier
+        return True
+
+    @staticmethod
+    def _is_clean_exit(state: dict[str, object]) -> bool:
+        return (
+            state.get("Status") == "exited"
+            and state.get("Running") is False
+            and state.get("Restarting") is False
+            and state.get("Dead") is False
+            and state.get("OOMKilled") is False
+            and type(state.get("ExitCode")) is int
+            and state.get("ExitCode") == 0
+            and state.get("Error") == ""
+        )
 
     def is_stopped(self) -> bool:
         try:
-            state = self.inspect_state()
+            identifier = self.container_id()
         except ServiceInspectionError as error:
             LOGGER.error("Service stop state is unknown: %s", error)
             return False
-        return state is None or state.get("Running") is False
+        if self._verified_stopped_identifier is not None:
+            if identifier != self._verified_stopped_identifier:
+                LOGGER.error("The verified stopped container identity changed")
+                return False
+        elif identifier is None:
+            return True
+        if identifier is None:
+            LOGGER.error("The verified stopped container disappeared")
+            return False
+        try:
+            state = self.inspect_container_state(identifier)
+        except ServiceInspectionError as error:
+            LOGGER.error("Service stop state is unknown: %s", error)
+            return False
+        return self._is_clean_exit(state)
 
     def start(self) -> bool:
         result = self._run(("up", "--detach", self.service), timeout=180)

@@ -111,9 +111,87 @@ def test_restart_and_start_require_command_success_and_health(
 @pytest.mark.parametrize(
     "state",
     [
-        {"Running": True, "OOMKilled": False, "ExitCode": 0},
-        {"Running": False, "OOMKilled": True, "ExitCode": 0},
-        {"Running": False, "OOMKilled": False, "ExitCode": 137},
+        {
+            "Status": "running",
+            "Running": True,
+            "Restarting": False,
+            "Dead": False,
+            "OOMKilled": False,
+            "ExitCode": 0,
+            "Error": "",
+        },
+        {
+            "Status": "exited",
+            "Running": False,
+            "Restarting": False,
+            "Dead": False,
+            "OOMKilled": True,
+            "ExitCode": 0,
+            "Error": "",
+        },
+        {
+            "Status": "exited",
+            "Running": False,
+            "Restarting": False,
+            "Dead": False,
+            "OOMKilled": False,
+            "ExitCode": False,
+            "Error": "",
+        },
+        {
+            "Status": "exited",
+            "Running": False,
+            "Restarting": False,
+            "Dead": False,
+            "OOMKilled": False,
+            "ExitCode": 137,
+            "Error": "",
+        },
+        {
+            "Status": "exited",
+            "Running": False,
+            "Restarting": True,
+            "Dead": False,
+            "OOMKilled": False,
+            "ExitCode": 0,
+            "Error": "",
+        },
+        {
+            "Status": "created",
+            "Running": False,
+            "Restarting": False,
+            "Dead": False,
+            "OOMKilled": False,
+            "ExitCode": 0,
+            "Error": "",
+        },
+        {
+            "Status": "exited",
+            "Running": False,
+            "Restarting": False,
+            "Dead": True,
+            "OOMKilled": False,
+            "ExitCode": 0,
+            "Error": "",
+        },
+        {
+            "Status": "dead",
+            "Running": False,
+            "Restarting": False,
+            "Dead": True,
+            "OOMKilled": False,
+            "ExitCode": 0,
+            "Error": "",
+        },
+        {
+            "Status": "exited",
+            "Running": False,
+            "Restarting": False,
+            "Dead": False,
+            "OOMKilled": False,
+            "ExitCode": 0,
+            "Error": "daemon failure",
+        },
     ],
 )
 def test_graceful_stop_requires_clean_exit_of_original_container(
@@ -131,7 +209,15 @@ def test_graceful_stop_requires_clean_exit_of_original_container(
 
 
 def test_graceful_stop_accepts_verified_clean_exit(monkeypatch: pytest.MonkeyPatch) -> None:
-    state = {"Running": False, "OOMKilled": False, "ExitCode": 0}
+    state = {
+        "Status": "exited",
+        "Running": False,
+        "Restarting": False,
+        "Dead": False,
+        "OOMKilled": False,
+        "ExitCode": 0,
+        "Error": "",
+    }
 
     def fake_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
         if command[:2] == ["docker", "inspect"]:
@@ -142,7 +228,37 @@ def test_graceful_stop_accepts_verified_clean_exit(monkeypatch: pytest.MonkeyPat
         return completed()
 
     monkeypatch.setattr(subprocess, "run", fake_run)
-    assert service().graceful_stop(120) is True
+    target = service()
+    assert target.graceful_stop(120) is True
+    assert target.is_stopped() is True
+
+
+@pytest.mark.parametrize("current_lookup", ["replacement-container\n", ""])
+def test_verified_stop_rejects_changed_or_missing_container(
+    current_lookup: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state = {
+        "Status": "exited",
+        "Running": False,
+        "Restarting": False,
+        "Dead": False,
+        "OOMKilled": False,
+        "ExitCode": 0,
+        "Error": "",
+    }
+    lookups = iter(("original-container\n", "original-container\n", current_lookup))
+
+    def fake_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        if command[:2] == ["docker", "inspect"]:
+            return completed(stdout=json.dumps(state))
+        if "ps" in command:
+            return completed(stdout=next(lookups))
+        return completed()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    target = service()
+    assert target.graceful_stop(120) is True
+    assert target.is_stopped() is False
 
 
 def test_graceful_stop_fails_when_post_stop_inspection_fails(

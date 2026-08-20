@@ -4,8 +4,18 @@ set -Eeuo pipefail
 readonly PROJECT_DIRECTORY=/opt/pz-stack
 readonly ENV_FILE=/srv/pz/secrets.env
 readonly WATCHDOG=/opt/pz-watchdog-venv/bin/pz-watchdog
+readonly WATCHDOG_VENV=/opt/pz-watchdog-venv
+readonly ROLLBACK_WATCHDOG_VENV=/opt/pz-watchdog-venv.rollback
 readonly COMPOSE=(docker compose --project-directory "${PROJECT_DIRECTORY}" --file "${PROJECT_DIRECTORY}/compose.yaml" --env-file "${ENV_FILE}")
 readonly BACKUP_LOCK=/run/pz-server-backup.lock
+readonly DEPLOY_READY_TIMEOUT_SECONDS=1800
+readonly DEPLOY_STATE_DIRECTORY=/var/lib/pz-deploy
+readonly DEPLOYED_COMMIT_FILE="${DEPLOY_STATE_DIRECTORY}/deployed-commit"
+readonly PENDING_DEPLOYMENT_FILE="${DEPLOY_STATE_DIRECTORY}/deployment-pending"
+readonly RECOVERY_PZCTL=/usr/local/sbin/pzctl-deploy-recovery
+readonly DEPLOY_START_AUTHORIZATION_FILE=/run/pz-deploy-start-authorized
+DEPLOY_GUARDIAN_SEQUENCE=0
+DEPLOY_GUARDIAN_UNIT=""
 export PZ_ENV_FILE="${ENV_FILE}"
 
 usage() {
@@ -17,6 +27,8 @@ Commands:
   save                     Request an RCON world save
   graceful-stop [--allow-connected-players]
                            Confirm RCON, save, and stop PZ cleanly
+  deploy COMMIT [--allow-connected-players]
+                           Safely deploy one exact 40-character Git commit
   restart [--allow-connected-players]
                            Gracefully stop and start PZ
   shutdown-host [--allow-connected-players]
@@ -33,9 +45,18 @@ require_root() {
 }
 
 acquire_lifecycle_lock() {
+    if [[ "${PZ_LIFECYCLE_LOCK_HELD:-false}" == true ]]; then
+        local inherited_lock
+        inherited_lock="$(readlink --canonicalize "/proc/${PPID}/fd/9" 2>/dev/null || true)"
+        [[ "${inherited_lock}" == "${BACKUP_LOCK}" ]] \
+            || { echo "Inherited lifecycle lock verification failed." >&2; exit 75; }
+        flock --exclusive --nonblock 9 \
+            || { echo "The inherited lifecycle descriptor does not own the lock." >&2; exit 75; }
+        return
+    fi
     exec 8>"${BACKUP_LOCK}"
     if ! flock --exclusive --nonblock 8; then
-        echo "A Project Zomboid backup holds the lifecycle lock; refusing this command." >&2
+        echo "Another Project Zomboid backup or lifecycle command holds the lock; refusing this command." >&2
         exit 75
     fi
 }
@@ -45,12 +66,34 @@ save_world() {
 }
 
 graceful_stop() {
+    graceful_stop_with_watchdog current "$@"
+}
+
+rollback_watchdog() {
+    [[ -x "${ROLLBACK_WATCHDOG_VENV}/bin/python" ]] \
+        || { echo "The previous watchdog environment is unavailable; refusing rollback stop." >&2; return 1; }
+    COMPOSE_PROJECT_DIRECTORY="${PROJECT_DIRECTORY}" \
+        "${ROLLBACK_WATCHDOG_VENV}/bin/python" -m pz_watchdog.cli "$@"
+}
+
+graceful_stop_with_watchdog() {
+    local watchdog_version="$1"
+    shift
     local watchdog_was_active=false
     if systemctl is-active --quiet pz-watchdog.service; then
         watchdog_was_active=true
     fi
-    systemctl stop pz-watchdog.service
-    if ! "${WATCHDOG}" graceful-stop "$@"; then
+    if ! systemctl stop pz-watchdog.service; then
+        echo "Could not stop the watchdog before the guarded PZ stop." >&2
+        return 1
+    fi
+    local stop_succeeded=false
+    if [[ "${watchdog_version}" == rollback ]]; then
+        rollback_watchdog graceful-stop "$@" && stop_succeeded=true
+    else
+        "${WATCHDOG}" graceful-stop "$@" && stop_succeeded=true
+    fi
+    if [[ "${stop_succeeded}" != true ]]; then
         echo "Safe stop validation failed; host shutdown is prohibited." >&2
         if [[ "${watchdog_was_active}" == true ]] && systemctl is-active --quiet pz-stack.service; then
             systemctl start pz-watchdog.service \
@@ -74,7 +117,10 @@ shutdown_host() {
     if systemctl is-active --quiet pz-watchdog.service; then
         watchdog_was_active=true
     fi
-    systemctl stop pz-watchdog.service
+    if ! systemctl stop pz-watchdog.service; then
+        echo "Could not stop the watchdog before guarded host shutdown." >&2
+        return 1
+    fi
     if ! "${WATCHDOG}" shutdown-host "$@"; then
         echo "Guarded host shutdown failed; the host remains online." >&2
         if [[ "${watchdog_was_active}" == true ]] && systemctl is-active --quiet pz-stack.service; then
@@ -82,6 +128,581 @@ shutdown_host() {
         fi
         return 1
     fi
+}
+
+compose_server_state() {
+    local output inspected
+    local -a identifiers=()
+    if ! output="$("${COMPOSE[@]}" ps --quiet --all server)"; then
+        printf '%s\n' unknown
+        return
+    fi
+    while IFS= read -r identifier; do
+        [[ -n "${identifier}" ]] && identifiers+=("${identifier}")
+    done <<< "${output}"
+    if (( ${#identifiers[@]} == 0 )); then
+        printf '%s\n' missing
+        return
+    fi
+    if (( ${#identifiers[@]} != 1 )); then
+        printf '%s\n' unknown
+        return
+    fi
+    if ! inspected="$(docker inspect --format '{{json .State}}' "${identifiers[0]}" 2>/dev/null)"; then
+        printf '%s\n' unknown
+        return
+    fi
+    if jq --exit-status '.Running == true and .Restarting == false' <<<"${inspected}" >/dev/null; then
+        printf '%s\n' running
+    elif jq --exit-status \
+        '.Status == "exited" and .Running == false and .Restarting == false and .Dead == false and .OOMKilled == false and .ExitCode == 0 and .Error == ""' \
+        <<<"${inspected}" >/dev/null; then
+        printf '%s\n' clean-stopped
+    else
+        printf '%s\n' unknown
+    fi
+}
+
+disable_server_restart_policy() {
+    local count output policy temporary
+    count="$(grep --count -- '^RESTART_POLICY=' "${ENV_FILE}" || true)"
+    [[ "${count}" =~ ^[0-9]+$ ]] && (( count <= 1 )) \
+        || { echo "${ENV_FILE} must contain at most one RESTART_POLICY entry." >&2; return 1; }
+    temporary="$(mktemp "${ENV_FILE}.XXXXXX")"
+    if ! awk '
+        /^RESTART_POLICY=/ { print "RESTART_POLICY=no"; found = 1; next }
+        { print }
+        END { if (!found) print "RESTART_POLICY=no" }
+    ' "${ENV_FILE}" > "${temporary}" \
+        || ! chmod 0600 "${temporary}" \
+        || ! chown root:root "${temporary}" \
+        || ! mv -- "${temporary}" "${ENV_FILE}" \
+        || ! sync -f "${ENV_FILE}" \
+        || ! sync -f "$(dirname "${ENV_FILE}")"; then
+        rm -f -- "${temporary}"
+        echo "Could not enforce RESTART_POLICY=no in ${ENV_FILE}." >&2
+        return 1
+    fi
+
+    local -a identifiers=()
+    if ! output="$("${COMPOSE[@]}" ps --quiet --all server)"; then
+        echo "Could not inspect the server restart policy." >&2
+        return 1
+    fi
+    while IFS= read -r identifier; do
+        [[ -n "${identifier}" ]] && identifiers+=("${identifier}")
+    done <<< "${output}"
+    if (( ${#identifiers[@]} == 0 )); then
+        return 0
+    fi
+    if (( ${#identifiers[@]} != 1 )); then
+        echo "Compose returned multiple server containers; refusing deployment." >&2
+        return 1
+    fi
+    if ! policy="$(docker inspect --format '{{.HostConfig.RestartPolicy.Name}}' "${identifiers[0]}")"; then
+        echo "Could not inspect the server container restart policy." >&2
+        return 1
+    fi
+    if [[ "${policy}" != no ]]; then
+        echo "Disabling Docker's independent ${policy:-unknown} restart policy before recording pending state."
+        docker update --restart=no "${identifiers[0]}" >/dev/null
+    fi
+    [[ "$(docker inspect --format '{{.HostConfig.RestartPolicy.Name}}' "${identifiers[0]}")" == no ]] \
+        || { echo "The server container restart policy is not safely disabled." >&2; return 1; }
+}
+
+unit_retains_deployment_guard() {
+    local unit="$1"
+    awk '
+        /^[[:space:]]*[#;]/ { next }
+        /^[[:space:]]*\[/ {
+            section = $0
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", section)
+            in_service = (section == "[Service]")
+            next
+        }
+        in_service {
+            line = $0
+            separator = index(line, "=")
+            if (separator == 0) next
+            key = substr(line, 1, separator - 1)
+            value = substr(line, separator + 1)
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", key)
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
+            if (key == "ExecCondition") {
+                if (value == "") guarded = 0
+                else if (value == "/usr/local/sbin/pz-deployment-unit-guard") guarded = 1
+            }
+        }
+        END { exit guarded ? 0 : 1 }
+    ' "${unit}"
+}
+
+preflight_deployment() {
+    local target="$1"
+    local staging
+    staging="$(mktemp --directory /tmp/pz-deploy.XXXXXX)"
+    if ! git -C "${PROJECT_DIRECTORY}" archive --format=tar "${target}" | tar --extract --directory "${staging}"; then
+        rm -rf -- "${staging}"
+        echo "Could not stage commit ${target} for deployment checks." >&2
+        return 1
+    fi
+    if [[ ! -r "${staging}/scripts/linux/install-host.sh" \
+        || ! -r "${staging}/scripts/linux/pzctl" \
+        || ! -r "${staging}/scripts/linux/deployment-unit-guard.sh" ]]; then
+        rm -rf -- "${staging}"
+        echo "Target commit is missing readable host lifecycle scripts." >&2
+        return 1
+    fi
+    if ! bash -n \
+        "${staging}/scripts/linux/install-host.sh" \
+        "${staging}/scripts/linux/pzctl" \
+        "${staging}/scripts/linux/deployment-unit-guard.sh"; then
+        rm -rf -- "${staging}"
+        echo "Target host lifecycle scripts failed shell syntax validation." >&2
+        return 1
+    fi
+    local unit
+    for unit in pz-stack.service pz-watchdog.service; do
+        if ! unit_retains_deployment_guard "${staging}/deploy/systemd/${unit}"; then
+            rm -rf -- "${staging}"
+            echo "Target systemd units do not retain the pending-deployment boot guard." >&2
+            return 1
+        fi
+    done
+    local rendered_compose
+    if ! rendered_compose="$(docker compose \
+        --project-directory "${staging}" \
+        --file "${staging}/compose.yaml" \
+        --env-file "${ENV_FILE}" \
+        config --format json)"; then
+        rm -rf -- "${staging}"
+        echo "Target Compose configuration failed validation." >&2
+        return 1
+    fi
+    if ! jq --exit-status '.services.server.restart == "no"' <<<"${rendered_compose}" >/dev/null; then
+        rm -rf -- "${staging}"
+        echo "Target Compose configuration does not retain the systemd-owned restart policy." >&2
+        return 1
+    fi
+    rm -rf -- "${staging}"
+}
+
+write_deployment_state() {
+    local destination="$1"
+    local content="$2"
+    local temporary="${destination}.tmp.$$"
+    if ! printf '%s\n' "${content}" > "${temporary}"; then
+        return 1
+    fi
+    if ! chmod 0600 "${temporary}"; then
+        rm -f -- "${temporary}"
+        return 1
+    fi
+    if ! mv -- "${temporary}" "${destination}"; then
+        rm -f -- "${temporary}"
+        return 1
+    fi
+    sync -f "${destination}" && sync -f "$(dirname "${destination}")"
+}
+
+record_deployed_commit() {
+    local commit="$1"
+    if ! write_deployment_state "${DEPLOYED_COMMIT_FILE}" "${commit}"; then
+        echo "Could not record deployed commit; pending recovery state is retained." >&2
+        return 1
+    fi
+    if ! rm -f -- "${PENDING_DEPLOYMENT_FILE}"; then
+        echo "Could not clear pending deployment state." >&2
+        return 1
+    fi
+    if ! sync -f "${DEPLOY_STATE_DIRECTORY}"; then
+        echo "Could not persist pending deployment removal." >&2
+        return 1
+    fi
+}
+
+process_start_time() {
+    local pid="$1"
+    local stat_line fields
+    IFS= read -r stat_line < "/proc/${pid}/stat" || return 1
+    fields="${stat_line##*) }"
+    awk '{print $20}' <<<"${fields}"
+}
+
+start_deployment_guardian() {
+    local start_time="$1"
+    if [[ -n "${DEPLOY_GUARDIAN_UNIT}" ]] \
+        && systemctl is-active --quiet "${DEPLOY_GUARDIAN_UNIT}"; then
+        return 0
+    fi
+    ((DEPLOY_GUARDIAN_SEQUENCE += 1))
+    DEPLOY_GUARDIAN_UNIT="pz-deployment-guardian-$$-${DEPLOY_GUARDIAN_SEQUENCE}.service"
+    if ! systemd-run --quiet --collect \
+        --unit="${DEPLOY_GUARDIAN_UNIT}" \
+        --property=Type=exec \
+        -- /usr/local/sbin/pz-deployment-unit-guard monitor "$$" "${start_time}"; then
+        DEPLOY_GUARDIAN_UNIT=""
+        return 1
+    fi
+    local attempt
+    for ((attempt = 0; attempt < 50; attempt += 1)); do
+        systemctl is-active --quiet "${DEPLOY_GUARDIAN_UNIT}" && return 0
+        systemctl is-failed --quiet "${DEPLOY_GUARDIAN_UNIT}" && break
+        sleep 0.1
+    done
+    systemctl stop "${DEPLOY_GUARDIAN_UNIT}" 2>/dev/null || true
+    DEPLOY_GUARDIAN_UNIT=""
+    return 1
+}
+
+stop_deployment_guardian() {
+    [[ -n "${DEPLOY_GUARDIAN_UNIT}" ]] || return 0
+    systemctl stop "${DEPLOY_GUARDIAN_UNIT}" 2>/dev/null || true
+    if systemctl is-active --quiet "${DEPLOY_GUARDIAN_UNIT}"; then
+        return 1
+    fi
+    DEPLOY_GUARDIAN_UNIT=""
+}
+
+authorize_deployment_start() {
+    local guardian_required="${1:-true}"
+    local start_time
+    [[ "${guardian_required}" == true || "${guardian_required}" == false ]] || return 64
+    start_time="$(process_start_time "$$")" || return 1
+    if ! write_deployment_state \
+        "${DEPLOY_START_AUTHORIZATION_FILE}" \
+        "PZ_DEPLOY_START=$$:${start_time}"; then
+        return 1
+    fi
+    if [[ "${guardian_required}" == true ]] && ! start_deployment_guardian "${start_time}"; then
+        rm -f -- "${DEPLOY_START_AUTHORIZATION_FILE}"
+        return 1
+    fi
+}
+
+revoke_deployment_start() {
+    local succeeded=true
+    stop_deployment_guardian || succeeded=false
+    rm -f -- "${DEPLOY_START_AUTHORIZATION_FILE}" || succeeded=false
+    [[ "${succeeded}" == true ]]
+}
+
+verify_watchdog_active() {
+    systemctl is-active --quiet pz-watchdog.service \
+        || { echo "The watchdog service is not active." >&2; return 1; }
+    sleep 5
+    systemctl is-active --quiet pz-watchdog.service \
+        || { echo "The watchdog service did not remain active." >&2; return 1; }
+}
+
+verify_deployment_ready() {
+    local watchdog_version="$1"
+    local ready=false
+    if [[ "${watchdog_version}" == rollback ]]; then
+        rollback_watchdog wait-ready --timeout "${DEPLOY_READY_TIMEOUT_SECONDS}" && ready=true
+    else
+        "${WATCHDOG}" wait-ready --timeout "${DEPLOY_READY_TIMEOUT_SECONDS}" && ready=true
+    fi
+    [[ "${ready}" == true ]] || return 1
+    verify_watchdog_active
+}
+
+quiesce_for_deployment() {
+    local watchdog_version="$1"
+    shift
+    local server_state
+    server_state="$(compose_server_state)"
+    case "${server_state}" in
+        running)
+            graceful_stop_with_watchdog "${watchdog_version}" "$@"
+            ;;
+        clean-stopped|missing)
+            if ! systemctl stop pz-watchdog.service pz-stack.service; then
+                echo "Could not stop inactive deployment units safely." >&2
+                return 1
+            fi
+            server_state="$(compose_server_state)"
+            if [[ "${server_state}" != clean-stopped && "${server_state}" != missing ]]; then
+                echo "Container state changed while preparing deployment; refusing to continue." >&2
+                return 1
+            fi
+            ;;
+        *)
+            echo "Deployment requires a running service that can stop safely, one clean stopped container, or no container." >&2
+            return 1
+            ;;
+    esac
+}
+
+deployment_interrupted() {
+    trap - INT TERM
+    rm -f -- "${DEPLOY_START_AUTHORIZATION_FILE}" || true
+    systemctl stop pz-watchdog.service pz-stack.service || true
+    echo "Deployment interrupted; services were stopped and the pending marker remains for an exact-SHA retry." >&2
+    exit 130
+}
+
+rollback_deployment() {
+    local previous="$1"
+    shift
+    echo "Attempting a guarded stop with the previous watchdog before rollback." >&2
+    local quiesce_succeeded=false
+    if authorize_deployment_start; then
+        quiesce_for_deployment rollback "$@" && quiesce_succeeded=true
+    fi
+    if ! revoke_deployment_start; then
+        quiesce_succeeded=false
+    fi
+    if [[ "${quiesce_succeeded}" != true ]]; then
+        echo "Automatic rollback is prohibited because the target service is not provably quiescent." >&2
+        return 1
+    fi
+
+    if ! git -C "${PROJECT_DIRECTORY}" checkout --detach --force "${previous}"; then
+        echo "Could not restore repository commit ${previous}; services remain stopped." >&2
+        return 1
+    fi
+    if ! rm -rf -- "${WATCHDOG_VENV}"; then
+        echo "Could not remove the partial target watchdog environment." >&2
+        return 1
+    fi
+    if ! mv -- "${ROLLBACK_WATCHDOG_VENV}" "${WATCHDOG_VENV}"; then
+        echo "Could not restore the preserved previous watchdog environment." >&2
+        return 1
+    fi
+    if ! authorize_deployment_start; then
+        echo "Could not authorize the guarded previous-service start." >&2
+        return 1
+    fi
+    local install_succeeded=false
+    if PZ_PRESERVE_WATCHDOG_VENV=true PZ_DATA_ROOT=/srv/pz \
+        bash "${PROJECT_DIRECTORY}/scripts/linux/install-host.sh"; then
+        install_succeeded=true
+    fi
+    if [[ "${install_succeeded}" != true ]]; then
+        echo "Previous commit installation also failed; manual recovery is required." >&2
+        return 1
+    fi
+    if ! verify_deployment_ready current; then
+        echo "Previous commit was restored but did not become ready; manual recovery is required." >&2
+        return 1
+    fi
+    if ! record_deployed_commit "${previous}"; then
+        return 1
+    fi
+    if ! revoke_deployment_start; then
+        echo "Could not revoke deployment start authorization." >&2
+        return 1
+    fi
+    rm -f -- "${RECOVERY_PZCTL}" || true
+    echo "Rolled back safely to ${previous}." >&2
+}
+
+deploy_commit() {
+    local target="${1:-}"
+    shift || true
+    local -a stop_arguments=()
+    if [[ "${target}" =~ ^[0-9a-fA-F]{40}$ ]]; then
+        target="${target,,}"
+    else
+        echo "Deployment requires one exact 40-character Git commit SHA." >&2
+        return 64
+    fi
+    if (( $# == 1 )) && [[ "$1" == --allow-connected-players ]]; then
+        stop_arguments+=(--allow-connected-players)
+    elif (( $# != 0 )); then
+        echo "Usage: pzctl deploy COMMIT [--allow-connected-players]" >&2
+        return 64
+    fi
+
+    [[ -d "${PROJECT_DIRECTORY}/.git" ]] || { echo "${PROJECT_DIRECTORY} is not a Git checkout." >&2; return 1; }
+    [[ -z "$(git -C "${PROJECT_DIRECTORY}" status --porcelain --untracked-files=all)" ]] \
+        || { echo "The production checkout is dirty; refusing to overwrite local changes." >&2; return 1; }
+
+    install -d -m 0700 "${DEPLOY_STATE_DIRECTORY}"
+    disable_server_restart_policy
+
+    local remote="" previous="" current="" fetched="" pending_target="" pending_extra=""
+    local deployed=""
+    local pending_exists=false
+    if [[ -r "${PENDING_DEPLOYMENT_FILE}" ]]; then
+        read -r previous pending_target pending_extra < "${PENDING_DEPLOYMENT_FILE}" || true
+        if [[ ! "${previous:-}" =~ ^[0-9a-f]{40}$ \
+            || ! "${pending_target:-}" =~ ^[0-9a-f]{40}$ \
+            || -n "${pending_extra:-}" ]]; then
+            echo "Pending deployment state is malformed; refusing automatic recovery." >&2
+            return 1
+        fi
+        [[ "${pending_target}" == "${target}" ]] \
+            || { echo "Commit ${pending_target} is pending; retry that exact SHA before another deployment." >&2; return 1; }
+        current="$(git -C "${PROJECT_DIRECTORY}" rev-parse --verify HEAD)"
+        [[ "${current}" == "${previous}" || "${current}" == "${target}" ]] \
+            || { echo "The checkout no longer matches either side of the pending deployment." >&2; return 1; }
+        if [[ "${current}" == "${target}" \
+            && "${previous}" != "${target}" \
+            && ! -d "${ROLLBACK_WATCHDOG_VENV}" ]]; then
+            echo "Pending target checkout has no preserved previous watchdog; refusing unsafe recovery." >&2
+            return 1
+        fi
+        pending_exists=true
+        echo "Resuming interrupted deployment ${previous} -> ${target}."
+        fetched="$(git -C "${PROJECT_DIRECTORY}" rev-parse --verify "${target}^{commit}" 2>/dev/null || true)"
+        [[ "${fetched}" == "${target}" ]] \
+            || { echo "The already-fetched pending commit is unavailable locally; refusing network-dependent recovery." >&2; return 1; }
+        preflight_deployment "${target}"
+    else
+        remote="$(git -C "${PROJECT_DIRECTORY}" remote get-url origin)"
+        [[ "${remote}" == https://* && "${remote}" != *"@"* ]] \
+            || { echo "The origin must remain a credential-free HTTPS URL." >&2; return 1; }
+        echo "Fetching exact deployment commit ${target} before any service interruption."
+        timeout 5m git -C "${PROJECT_DIRECTORY}" fetch --no-tags --depth=1 origin "${target}"
+        fetched="$(git -C "${PROJECT_DIRECTORY}" rev-parse --verify 'FETCH_HEAD^{commit}')"
+        [[ "${fetched}" == "${target}" ]] \
+            || { echo "Fetched commit does not match the requested immutable SHA." >&2; return 1; }
+        preflight_deployment "${target}"
+        previous="$(git -C "${PROJECT_DIRECTORY}" rev-parse --verify HEAD)"
+        deployed="$(cat "${DEPLOYED_COMMIT_FILE}" 2>/dev/null || true)"
+        if [[ -n "${deployed}" && ! "${deployed}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Recorded deployed commit is malformed; refusing deployment." >&2
+            return 1
+        fi
+        if [[ -z "${deployed}" && "${previous}" != "${target}" ]]; then
+            echo "No deployed-commit marker exists. First deploy the current HEAD ${previous} to establish a verified baseline." >&2
+            return 1
+        fi
+        if [[ -n "${deployed}" && "${deployed}" != "${previous}" ]]; then
+            echo "Git HEAD does not match the last completed deployment; refusing to adopt repository drift." >&2
+            return 1
+        fi
+    fi
+
+    if [[ "${pending_exists}" == false && "${deployed}" == "${target}" ]]; then
+        echo "Commit ${target} is already deployed; verifying readiness without restarting."
+        verify_deployment_ready current
+        return
+    fi
+
+    if [[ ! -d "${ROLLBACK_WATCHDOG_VENV}" && ! -x "${WATCHDOG_VENV}/bin/python" ]]; then
+        echo "The current watchdog environment is missing; refusing an unprotected deployment." >&2
+        return 1
+    fi
+
+    if [[ "${pending_exists}" == false ]]; then
+        if ! rm -rf -- "${ROLLBACK_WATCHDOG_VENV}"; then
+            return 1
+        fi
+        if ! install -m 0755 /usr/local/bin/pzctl "${RECOVERY_PZCTL}"; then
+            echo "Could not preserve the current deployment orchestrator." >&2
+            return 1
+        fi
+        if ! sync -f "${RECOVERY_PZCTL}" || ! sync -f "$(dirname "${RECOVERY_PZCTL}")"; then
+            rm -f -- "${RECOVERY_PZCTL}"
+            echo "Could not persist the recovery orchestrator." >&2
+            return 1
+        fi
+        if ! write_deployment_state "${PENDING_DEPLOYMENT_FILE}" "${previous} ${target}"; then
+            rm -f -- "${RECOVERY_PZCTL}"
+            return 1
+        fi
+    fi
+    local stop_watchdog_version=current
+    if [[ -d "${ROLLBACK_WATCHDOG_VENV}" ]]; then
+        stop_watchdog_version=rollback
+    fi
+    local quiesce_succeeded=false
+    local candidate_guardian_required=false
+    if [[ "${pending_exists}" == true && "${current}" == "${target}" && "${previous}" != "${target}" ]]; then
+        candidate_guardian_required=true
+        trap deployment_interrupted INT TERM
+    fi
+    if authorize_deployment_start "${candidate_guardian_required}"; then
+        quiesce_for_deployment "${stop_watchdog_version}" "${stop_arguments[@]}" \
+            && quiesce_succeeded=true
+    fi
+    if ! revoke_deployment_start; then
+        quiesce_succeeded=false
+    fi
+    if [[ "${quiesce_succeeded}" != true ]]; then
+        if [[ "${pending_exists}" == false ]]; then
+            rm -f -- "${PENDING_DEPLOYMENT_FILE}"
+            rm -f -- "${RECOVERY_PZCTL}"
+            sync -f "${DEPLOY_STATE_DIRECTORY}" || true
+        fi
+        trap - INT TERM
+        return 1
+    fi
+    trap deployment_interrupted INT TERM
+    if [[ ! -d "${ROLLBACK_WATCHDOG_VENV}" ]]; then
+        if ! mv -- "${WATCHDOG_VENV}" "${ROLLBACK_WATCHDOG_VENV}"; then
+            echo "Could not preserve the previous watchdog environment." >&2
+            trap - INT TERM
+            return 1
+        fi
+    fi
+
+    if ! git -C "${PROJECT_DIRECTORY}" checkout --detach --force "${target}"; then
+        echo "Checkout failed after the safe stop; attempting guarded rollback." >&2
+        if ! rollback_deployment "${previous}" "${stop_arguments[@]}"; then
+            echo "Guarded rollback failed; pending recovery state is retained." >&2
+        fi
+        trap - INT TERM
+        return 1
+    fi
+
+    local target_installed=false
+    if authorize_deployment_start; then
+        if PZ_DATA_ROOT=/srv/pz bash "${PROJECT_DIRECTORY}/scripts/linux/install-host.sh"; then
+            target_installed=true
+        fi
+    fi
+    if [[ "${target_installed}" == true ]] && verify_deployment_ready rollback; then
+        if record_deployed_commit "${target}"; then
+            if ! revoke_deployment_start; then
+                echo "Could not revoke deployment start authorization." >&2
+                trap - INT TERM
+                return 1
+            fi
+            rm -rf -- "${ROLLBACK_WATCHDOG_VENV}" || true
+            rm -f -- "${RECOVERY_PZCTL}" || true
+            trap - INT TERM
+            echo "Deployment ${target} is healthy and RCON-responsive."
+            return
+        fi
+        echo "Could not commit healthy deployment state; attempting rollback." >&2
+    fi
+
+    echo "Deployment ${target} failed installation or readiness checks." >&2
+    if ! rollback_deployment "${previous}" "${stop_arguments[@]}"; then
+        echo "Guarded rollback failed; pending recovery state is retained." >&2
+    fi
+    trap - INT TERM
+    return 1
+}
+
+start_stack() {
+    [[ ! -e "${PENDING_DEPLOYMENT_FILE}" ]] \
+        || { echo "A deployment is pending; retry its exact SHA instead of starting partial state." >&2; return 1; }
+    local server_state
+    server_state="$(compose_server_state)"
+    case "${server_state}" in
+        running)
+            systemctl is-active --quiet pz-stack.service \
+                || { echo "The server container is running outside an active pz-stack.service; use a guarded restart to reconcile it." >&2; return 1; }
+            systemctl start pz-watchdog.service
+            ;;
+        clean-stopped|missing)
+            systemctl restart pz-stack.service
+            systemctl restart pz-watchdog.service
+            ;;
+        *)
+            echo "Container state is unknown or unclean; refusing to start over it." >&2
+            return 1
+            ;;
+    esac
+    [[ "$(compose_server_state)" == running ]] \
+        || { echo "pz-stack.service did not start the server container." >&2; return 1; }
+    verify_watchdog_active
 }
 
 main() {
@@ -92,16 +713,21 @@ main() {
     case "${command}" in
         start)
             acquire_lifecycle_lock
-            systemctl start pz-stack.service
-            systemctl start pz-watchdog.service
+            start_stack
             ;;
         save) save_world ;;
-        graceful-stop) graceful_stop "$@" ;;
+        graceful-stop)
+            acquire_lifecycle_lock
+            graceful_stop "$@"
+            ;;
+        deploy)
+            acquire_lifecycle_lock
+            deploy_commit "$@"
+            ;;
         restart)
             acquire_lifecycle_lock
             graceful_stop "$@"
-            systemctl start pz-stack.service
-            systemctl start pz-watchdog.service
+            start_stack
             ;;
         shutdown-host)
             acquire_lifecycle_lock

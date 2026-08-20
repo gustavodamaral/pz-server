@@ -7,6 +7,7 @@ readonly PZ_DATA_ROOT="${PZ_DATA_ROOT:-/srv/pz}"
 readonly ENV_FILE="${PZ_DATA_ROOT}/secrets.env"
 readonly VENV_DIRECTORY=/opt/pz-watchdog-venv
 readonly RCON_CLI_VERSION=1.7.7
+readonly PRESERVE_WATCHDOG_VENV="${PZ_PRESERVE_WATCHDOG_VENV:-false}"
 
 log() {
     local level="$1"
@@ -17,6 +18,44 @@ log() {
 die() {
     log ERROR "$*"
     exit 1
+}
+
+install_file_atomically() {
+    local source="$1"
+    local destination="$2"
+    local mode="$3"
+    local temporary
+    temporary="$(mktemp "${destination}.XXXXXX")"
+    if ! install -o root -g root -m "${mode}" "${source}" "${temporary}" \
+        || ! mv -- "${temporary}" "${destination}" \
+        || ! sync -f "${destination}" \
+        || ! sync -f "$(dirname "${destination}")"; then
+        rm -f -- "${temporary}"
+        die "Could not publish ${destination} atomically."
+    fi
+}
+
+set_managed_environment_value() {
+    local key="$1"
+    local value="$2"
+    local count temporary
+    count="$(grep --count -- "^${key}=" "${ENV_FILE}" || true)"
+    [[ "${count}" =~ ^[0-9]+$ ]] && (( count <= 1 )) \
+        || die "${ENV_FILE} must contain at most one ${key} entry."
+    temporary="$(mktemp "${ENV_FILE}.XXXXXX")"
+    if ! awk -v key="${key}" -v value="${value}" '
+        index($0, key "=") == 1 { print key "=" value; found = 1; next }
+        { print }
+        END { if (!found) print key "=" value }
+    ' "${ENV_FILE}" > "${temporary}" \
+        || ! chmod 0600 "${temporary}" \
+        || ! chown root:root "${temporary}" \
+        || ! mv -- "${temporary}" "${ENV_FILE}" \
+        || ! sync -f "${ENV_FILE}" \
+        || ! sync -f "$(dirname "${ENV_FILE}")"; then
+        rm -f -- "${temporary}"
+        die "Could not enforce ${key}=${value} in ${ENV_FILE}."
+    fi
 }
 
 install_rcon_cli() {
@@ -46,6 +85,7 @@ create_environment() {
     if [[ -e "${ENV_FILE}" ]]; then
         chmod 0600 "${ENV_FILE}"
         chown root:root "${ENV_FILE}"
+        set_managed_environment_value RESTART_POLICY no
         log INFO "Preserving existing production secrets at ${ENV_FILE}."
         return
     fi
@@ -70,7 +110,7 @@ GAME_PORT=16261
 DIRECT_PORT=16262
 RCON_PORT=27015
 PZ_XMS=4g
-PZ_XMX=12g
+PZ_XMX=8g
 CONTAINER_CPUS=4.0
 CONTAINER_MEMORY_LIMIT=14g
 PZ_UID=1000
@@ -80,10 +120,9 @@ PZ_DATA_PATH=${PZ_DATA_ROOT}/data
 MODS=
 WORKSHOP_ITEMS=
 MAP_NAMES=Muldraugh, KY
-RESTART_POLICY=unless-stopped
+RESTART_POLICY=no
 SHUTDOWN_SAVE_SECONDS=15
 SHUTDOWN_GRACE_SECONDS=90
-STATISTICS_PERIOD=0
 TZ=UTC
 IDLE_TIMEOUT_MINUTES=45
 POLL_INTERVAL_SECONDS=60
@@ -109,22 +148,33 @@ EOF
 }
 
 install_watchdog() {
-    python3 -m venv "${VENV_DIRECTORY}"
-    timeout 10m "${VENV_DIRECTORY}/bin/pip" install --disable-pip-version-check --no-cache-dir "${PROJECT_DIRECTORY}"
-    install -m 0755 "${PROJECT_DIRECTORY}/scripts/linux/pzctl" /usr/local/bin/pzctl
-    install -m 0755 "${PROJECT_DIRECTORY}/scripts/linux/backup.sh" /usr/local/bin/pz-backup
-    install -m 0755 "${PROJECT_DIRECTORY}/scripts/linux/resize-data-volume.sh" /usr/local/sbin/pz-resize-data-volume
+    if [[ "${PRESERVE_WATCHDOG_VENV}" == true ]]; then
+        [[ -x "${VENV_DIRECTORY}/bin/python" ]] \
+            || die "PZ_PRESERVE_WATCHDOG_VENV=true but the previous environment is unavailable."
+    elif [[ "${PRESERVE_WATCHDOG_VENV}" == false ]]; then
+        python3 -m venv "${VENV_DIRECTORY}"
+        timeout 10m "${VENV_DIRECTORY}/bin/pip" install --disable-pip-version-check --no-cache-dir "${PROJECT_DIRECTORY}"
+    else
+        die "PZ_PRESERVE_WATCHDOG_VENV must be true or false."
+    fi
+    install_file_atomically "${PROJECT_DIRECTORY}/scripts/linux/pzctl" /usr/local/bin/pzctl 0755
+    install_file_atomically "${PROJECT_DIRECTORY}/scripts/linux/backup.sh" /usr/local/bin/pz-backup 0755
+    install_file_atomically "${PROJECT_DIRECTORY}/scripts/linux/resize-data-volume.sh" /usr/local/sbin/pz-resize-data-volume 0755
+    install_file_atomically "${PROJECT_DIRECTORY}/scripts/linux/deployment-unit-guard.sh" /usr/local/sbin/pz-deployment-unit-guard 0755
 }
 
 install_services() {
-    install -m 0644 "${PROJECT_DIRECTORY}/deploy/systemd/pz-stack.service" /etc/systemd/system/pz-stack.service
-    install -m 0644 "${PROJECT_DIRECTORY}/deploy/systemd/pz-watchdog.service" /etc/systemd/system/pz-watchdog.service
+    install_file_atomically "${PROJECT_DIRECTORY}/deploy/systemd/pz-stack.service" /etc/systemd/system/pz-stack.service 0644
+    install_file_atomically "${PROJECT_DIRECTORY}/deploy/systemd/pz-watchdog.service" /etc/systemd/system/pz-watchdog.service 0644
     printf '%s\n' 'PZ_HOST_SHUTDOWN=ENABLED' > /etc/pz-server/allow-host-shutdown
     chmod 0600 /etc/pz-server/allow-host-shutdown
     systemctl daemon-reload
     systemctl enable pz-stack.service pz-watchdog.service
     systemctl restart pz-stack.service
     systemctl restart pz-watchdog.service
+    sleep 5
+    systemctl is-active --quiet pz-watchdog.service \
+        || die "Project Zomboid watchdog did not remain active after installation."
 }
 
 main() {

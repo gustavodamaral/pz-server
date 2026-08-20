@@ -28,10 +28,9 @@ restart_if_needed() {
     if [[ "${backup_complete}" != true && -n "${final_archive}" ]]; then
         rm -f -- "${final_archive}" "${final_archive}.sha256"
     fi
-    flock --unlock 9 || true
     if [[ "${was_running}" == true ]]; then
         log INFO "Restarting Project Zomboid after backup attempt."
-        if ! pzctl start; then
+        if ! PZ_LIFECYCLE_LOCK_HELD=true pzctl start; then
             log ERROR "Project Zomboid restart failed; manual intervention is required."
             status=1
         fi
@@ -41,6 +40,7 @@ restart_if_needed() {
             status=1
         fi
     fi
+    flock --unlock 9 || true
     exit "${status}"
 }
 
@@ -60,7 +60,7 @@ verify_quiescent() {
         return 0
     fi
     state="$(container_state "${expected_identifier}")"
-    jq --exit-status '.Running == false and .Restarting == false and .OOMKilled == false and .ExitCode == 0' \
+    jq --exit-status '.Status == "exited" and .Running == false and .Restarting == false and .Dead == false and .OOMKilled == false and .ExitCode == 0 and .Error == ""' \
         <<<"${state}" >/dev/null \
         || { echo "Server container is not in a verified clean stopped state." >&2; return 1; }
 }
@@ -126,9 +126,9 @@ main() {
         fi
         was_running=true
         if [[ "${allow_connected_players}" == true ]]; then
-            pzctl graceful-stop --allow-connected-players
+            PZ_LIFECYCLE_LOCK_HELD=true pzctl graceful-stop --allow-connected-players
         else
-            pzctl graceful-stop
+            PZ_LIFECYCLE_LOCK_HELD=true pzctl graceful-stop
         fi
     elif [[ -n "${identifier}" ]]; then
         verify_quiescent "${identifier}"

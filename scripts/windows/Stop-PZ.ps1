@@ -61,6 +61,7 @@ else {
         -Region $Region `
         -Profile $Profile `
         -TimeoutSeconds 300 `
+        -DeliveryTimeoutSeconds 60 `
         -Comment 'Gracefully stop Project Zomboid and power off host' `
         -Command $shutdownCommand
     $null = Wait-PZSsmCommand `
@@ -68,7 +69,7 @@ else {
         -InstanceId $instanceId `
         -Region $Region `
         -Profile $Profile `
-        -TimeoutSeconds 300
+        -TimeoutSeconds 390
 }
 
 Invoke-PZAwsWaiter -Waiter 'instance-stopped' -InstanceId $instanceId -Region $Region -Profile $Profile

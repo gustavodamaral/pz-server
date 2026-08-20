@@ -63,6 +63,7 @@ try {
         -Region $Region `
         -Profile $Profile `
         -TimeoutSeconds 60 `
+        -DeliveryTimeoutSeconds 30 `
         -Comment 'Collect Project Zomboid status' `
         -Command '/usr/local/bin/pzctl status --json'
     $invocation = Wait-PZSsmCommand `
@@ -70,7 +71,7 @@ try {
         -InstanceId $instance.InstanceId `
         -Region $Region `
         -Profile $Profile `
-        -TimeoutSeconds 90
+        -TimeoutSeconds 120
     $metrics = ([string] $invocation.StandardOutputContent).Trim() | ConvertFrom-Json
 }
 catch {

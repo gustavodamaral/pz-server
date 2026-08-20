@@ -8,18 +8,19 @@
 - IAM role/profile with `AmazonSSMManagedInstanceCore`
 - Disposable encrypted gp3 root volume
 - Independent encrypted 40 GiB gp3 world volume with baseline 3,000 IOPS/125 MiB/s and `prevent_destroy`
+- Optional account-wide AWS Budget with direct warning/critical email notifications and no actions
 
 There is no EIP, NAT Gateway, Route53 record, backup vault, CloudWatch custom metric/log subscription, or snapshot schedule by default.
 
 ## Before Apply
 
-1. Push a reviewed commit to the configured credential-free `repository_url` and put its exact 40-character SHA in `repository_ref`.
+1. Push a reviewed commit to the configured credential-free `repository_url` and put its exact 40-character SHA in the bootstrap-only `repository_ref`.
 2. Authenticate AWS CLI with a non-root principal and confirm the target account: `aws sts get-caller-identity`.
-3. Review current EC2/EBS/public IPv4 pricing and service quotas in the chosen region/AZ.
+3. Review current EC2/EBS/public IPv4 pricing and service quotas. Terraform will reject an explicit AZ, or fail automatic selection, unless both normal and party instance types are offered there.
 4. Copy `terraform.tfvars.example`; put only non-secret infrastructure values in it. For an initial blank volume only, explicitly set `initialize_blank_data_volume=true`.
 5. Arrange secure remote state before collaboration. Application secrets are absent, but Terraform state still contains infrastructure identifiers and user data.
 6. Run `init`, `fmt -check`, `validate`, and inspect a saved plan.
-7. After the initial server becomes healthy, stop it gracefully, set `initialize_blank_data_volume=false`, and apply the reviewed instance-replacement plan. Never leave format authorization armed.
+7. Immediately after initial creation, set `initialize_blank_data_volume=false` and apply again. User data is creation-only and ignored on the existing host, so this disarms future hosts without replacing the current instance. Never leave format authorization armed.
 
 No automation in this repository runs `terraform apply`.
 
@@ -36,7 +37,7 @@ sudo docker compose --project-directory /opt/pz-stack --env-file /srv/pz/secrets
 sudo pzctl logs
 ```
 
-Common first-boot blockers are missing one-time initialization authorization, an unreachable/private Git URL, a commit not pushed, Steam download delay, Docker Hub/GitHub/Valve egress failure, or the EBS attachment not arriving before the guarded timeout. Network/package/Git operations are bounded, but a failed host remains online for SSM diagnosis because player state is unknown. Configure an AWS Billing alarm and stop it through the guarded helper after diagnosis.
+Common first-boot blockers are missing one-time initialization authorization, an unreachable/private Git URL, a commit not pushed, Steam download delay, Docker Hub/GitHub/Valve egress failure, or the EBS attachment not arriving before the guarded timeout. Network/package/Git operations are bounded, but a failed host remains online for SSM diagnosis because player state is unknown. Enable the optional AWS Budget and stop a failed host through the guarded helper after diagnosis.
 
 `pz-stack.service` considers a successful Compose launch complete; `Start-PZ.ps1` separately waits for process health and RCON. A readiness timeout does not automatically stop the container or host because player state is unknown. Inspect exact Docker/RCON state before any EC2 action.
 
@@ -54,21 +55,84 @@ Rotate during a maintenance window:
 
 ## Normal and Party Modes
 
-The Windows helper discovers the instance by tags and uses Terraform-managed `PZNormalInstanceType`/`PZPartyInstanceType` tags as its allowlist unless parameters or the `.env` helper allowlist override them. `-Mode Party` can modify type only after stopped state is confirmed. EC2 cannot vertically resize live. Terraform's documented `ignore_changes = [ami, instance_type]` prevents an unrelated apply from reverting a deliberate runtime choice.
+The Windows helper discovers the instance by tags and uses Terraform-managed `PZNormalInstanceType`/`PZPartyInstanceType` tags as its allowlist unless parameters or the `.env` helper allowlist override them. `-Mode Party` can modify type only after stopped state is confirmed. EC2 cannot vertically resize live. Terraform's documented `ignore_changes = [ami, instance_type, user_data]` prevents an unrelated apply from reverting a deliberate runtime choice or applying bootstrap data to an existing host.
 
 The defaults are `r7a.large` (2 vCPUs, 16 GiB) for normal sessions and `m7a.xlarge` (4 vCPUs, 16 GiB) for CPU-heavier party sessions. The production container cap is four CPUs, so it naturally receives the two available in normal mode and can use four in party mode. Verify current AWS specifications and availability before relying on them.
 
 This also means changing `normal_instance_type` in Terraform does not resize an existing instance automatically. Use the stopped helper or deliberately revise the lifecycle strategy in a reviewed change.
 
+Terraform queries `DescribeInstanceTypeOfferings` for both configured types, intersects those results with standard currently available AZs, sorts the common names, and uses the first name when `availability_zone` is null. Enabled Local Zones are excluded to prevent an edge location from silently changing geography or cost. An explicit AZ must be in the same common set. Terraform also requires both types to provide at least 16 GiB RAM, be non-bare-metal, and support the selected Ubuntu AMI's `x86_64`, encrypted EBS-root, HVM, and On-Demand contract; dedicated-host-only and undersized classes are outside this design. These account/region queries occur during `plan`; CI runs only account-independent `validate` and never needs AWS credentials.
+
+After first creation, copy the `availability_zone` output into the explicit variable. This pins the AZ-scoped world volume against future offering-catalog changes; any incompatible type change then fails with a direct message instead of proposing an AZ move. Existing `prevent_destroy` remains the final barrier against accidental volume relocation.
+
 ## Public Address
 
 AWS releases the auto-assigned public IPv4 on stop and normally assigns a new one on start. `Start-PZ.ps1` always reads the current address after readiness. An optional Route53/DDNS layer can be added later without changing PZ, but is intentionally absent now.
+
+## Cost Alerts
+
+Cost alerts are disabled by default. To enable them, set:
+
+```hcl
+enable_cost_alerts   = true
+billing_alert_email  = "operator@example.com"
+billing_warning_usd  = 7
+billing_critical_usd = 10
+```
+
+Terraform creates one recurring monthly `COST` budget for the entire current AWS account. It sends direct email when either actual or forecast cost exceeds the absolute warning or critical threshold. Account-wide scope is intentional: it also catches a forgotten volume, public IPv4, snapshot, or unrelated resource. The email address is not a secret, but it is stored in Terraform state and should be handled as operator information.
+
+This configuration creates no AWS Budget action, SNS topic, Budget Report, IAM role, or automatic EC2 stop. AWS currently states that budget monitoring and ordinary notifications are free; action-enabled budgets and delivered Budget Reports have separate pricing. Direct `EMAIL` subscribers are used, so the AWS-documented SNS subscription-confirmation step does not apply. Verify delivery and spam filtering after creation.
+
+AWS billing data is delayed and currently updates at least daily. Actual alerts are sent once per budget period when first crossed. Forecast alerts can repeat and require approximately five weeks of usage history before AWS can generate forecasts. These notifications are an independent cost backstop, never a real-time lifecycle or player-safety signal.
+
+The Terraform principal needs AWS Budgets read/create/update/delete and notification-subscriber permissions when this option is enabled. Those permissions belong to the provisioning principal, not the EC2 instance role. Review the current [AWS Budgets pricing](https://aws.amazon.com/aws-cost-management/aws-budgets/pricing/) and [alert behavior](https://docs.aws.amazon.com/cost-management/latest/userguide/budgets-best-practices.html) before changing the design.
+
+## Application Deployments
+
+Terraform user data is creation-time bootstrap input. `repository_ref`, `repository_url`, the bootstrap script, and rendered cloud-init are ignored for updates to an existing EC2 instance, and `user_data_replace_on_change` is disabled. Editing application/config references followed by an unrelated apply therefore cannot replace or stop the host. A future intentional EC2 creation still uses the current exact SHA and bootstrap inputs.
+
+Deploy routine repository changes through the constrained SSM helper instead:
+
+```powershell
+$commit = git rev-parse HEAD
+.\scripts\windows\Deploy-PZ.ps1 -CommitSha $commit
+```
+
+The host transaction performs these steps:
+
+1. Require an exact 40-character SHA, a clean production checkout, and a credential-free HTTPS origin.
+2. Fetch and verify that SHA before any service interruption, then stage it temporarily for Bash syntax and production Compose rendering checks.
+3. Take the same lifecycle lock used by backups, query real players through RCON, confirm save, and require an exact clean container stop.
+4. Disable any legacy Docker-managed restart policy, record a durable root-only pending transaction, preserve both the previous deployment orchestrator and watchdog environment, check out detached HEAD, atomically reinstall repository-owned host tooling/services, and require Docker health, valid RCON, and a continuously active watchdog service.
+5. Record the deployed SHA only after readiness. An interrupted exact-SHA retry is routed to the preserved orchestrator and uses the already-fetched local commit instead of treating Git `HEAD` as completion or depending on the network. While pending, systemd start conditions and an independent transient guardian require the live lock-owning transaction to remain present; interruption stops partial services.
+6. On failure, rollback uses the preserved previous watchdog and venv without a new package download. It proceeds only after the target container is missing, cleanly stopped, or passes the guarded stop. Connected players, `UNKNOWN`, OOM, nonzero exit, restart/dead state, Docker error, or inspection failure prohibit automatic rollback and leave the host online for diagnosis.
+
+`-AllowConnectedPlayers` is an explicit announced-maintenance override for known players; it never overrides `UNKNOWN`. The helper accepts no branch, repository URL, credential, or arbitrary command text. Runtime secrets and operational values in `/srv/pz/secrets.env` remain persistent host configuration and are not moved into Terraform.
+
+New hosts record their bootstrap SHA after host installation. For a host created before this deployment marker existed, first call `Deploy-PZ.ps1` with its current `git -C /opt/pz-stack rev-parse HEAD`; this intentionally reinstalls the same reviewed commit to establish a baseline before any different SHA is accepted. The SSM command execution timeout defaults to 150 minutes so the bounded target plus rollback path fits; command delivery has a separate five-minute deadline and the local waiter covers both periods plus polling margin. A timeout leaves the pending marker and requires retrying the same SHA.
+
+Changing installer defaults generally does not rewrite an existing `secrets.env`; adjust a legacy `PZ_XMX=12g` to `8g` during a measured maintenance window. The installer deliberately makes `RESTART_POLICY=no` a managed production invariant, and deployment also updates the existing container before pending state is recorded. Production systemd, not Docker's independent restart manager, must own boot ordering so the container cannot start before `/srv/pz` is mounted.
+
+## Intentional EC2 Replacement
+
+Terraform always creates and configures EC2 with API termination protection enabled. `allow_instance_replacement=true` persists one-time provider authorization in the current instance's Terraform state; it does not expose the instance to direct API termination. The AWS provider can remove protection during deletion only when `force_destroy=true` was already recorded in prior state, so arming and replacing in one apply is deliberately unsupported.
+
+Use this staged procedure:
+
+1. Create/verify a current off-volume backup, confirm no players, and run `.\scripts\windows\Stop-PZ.ps1` so EC2 reaches `stopped`.
+2. Plan with `-var='allow_instance_replacement=true'` and no replacement request. Inspect that the only intended EC2 change arms `force_destroy` while API termination protection remains enabled, then apply that saved plan.
+3. Create a second saved plan with `allow_instance_replacement=false` and `-replace=aws_instance.server`. The old state supplies the one-time deletion authorization while the replacement is immediately protected and disarmed. Verify that the protected `aws_ebs_volume.world` is unchanged and only the disposable instance/root volume and attachment lifecycle are affected.
+4. Apply the replacement plan, wait for bootstrap/readiness, and complete the acceptance checks before inviting players.
+5. Verify in state and EC2 that the replacement has `force_destroy=false` and API termination protection enabled.
+
+Never combine steps 2 and 3. Until a false-only disarm or the reviewed replacement plan is applied, prior state remains armed even if a later command merely supplies the variable as false. If replacement is abandoned, apply a saved plan whose only change is `force_destroy: true -> false`; an accidental replacement in that disarm plan could consume the prior authorization. This gate never disables EC2 API termination protection or `prevent_destroy` on the world volume.
 
 ## Persistent Volume and Replacement
 
 The volume is AZ-scoped. Keep the instance/subnet in that AZ. cloud-init identifies it by exact volume ID/serial and distinguishes recognized ext4 from absence of a recognized filesystem. It can format only when the explicit one-time Terraform permission is true and the whole device has no child partitions or signatures. Inspection errors, non-ext4 filesystems, and missing authorization fail without modifying the device.
 
-On intentional EC2 replacement, stop PZ first and verify a recent backup. Terraform detaches/reattaches through `aws_volume_attachment`; never force-detach a mounted active world volume.
+On intentional EC2 replacement, follow the staged protection workflow above. Terraform detaches/reattaches through `aws_volume_attachment`; never force-detach a mounted active world volume.
 
 `prevent_destroy` blocks ordinary destroy and replacements requiring volume destruction. This is deliberate. The retain/decommission sequence is in the README. To bring a retained volume back under management, add/import it only after matching AZ, encryption, and attachment design.
 
@@ -88,11 +152,12 @@ A conservative manual snapshot workflow:
 Rollback to a snapshot without overwriting the protected current volume:
 
 1. Stop PZ/EC2 gracefully and record both the current volume ID and rollback snapshot ID.
-2. Run `terraform -chdir=terraform destroy -target=aws_volume_attachment.world` and inspect that only the attachment is removed.
-3. Run `terraform -chdir=terraform state rm aws_ebs_volume.world`. This deliberately retains the old volume outside Terraform; record it because it continues to cost money.
-4. Set `data_volume_snapshot_id` to the rollback snapshot, keep `initialize_blank_data_volume=false`, and ensure `data_volume_size_gib` is at least the snapshot source size.
-5. Save and inspect a normal Terraform plan. It should create a new protected volume from the snapshot, replace the disposable EC2 instance because its exact volume ID is in first-boot data, and attach the new volume. It must not delete the retained old volume.
-6. Apply, validate world/player identity through SSM and a test client, and keep the old volume until acceptance. Delete or archive it later only through a separate explicit decision.
+2. Perform only the preparatory `allow_instance_replacement=true` apply from [Intentional EC2 Replacement](#intentional-ec2-replacement). Do this before changing volume state/configuration so the plan can contain only the maintenance gate.
+3. Run `terraform -chdir=terraform destroy -target=aws_volume_attachment.world -var='allow_instance_replacement=true'` and inspect that only the attachment is removed.
+4. Run `terraform -chdir=terraform state rm aws_ebs_volume.world`. This deliberately retains the old volume outside Terraform; record it because it continues to cost money.
+5. Set `data_volume_snapshot_id` to the rollback snapshot, keep `initialize_blank_data_volume=false`, and ensure `data_volume_size_gib` is at least the snapshot source size.
+6. Save a plan with `allow_instance_replacement=false` and `-replace=aws_instance.server`. It must create the new protected volume, replace the instance, disarm the replacement, and leave the retained old volume untouched. The explicit replacement is required because a volume removed from state is a pure create, not an update that Terraform can use as a replacement trigger.
+7. Apply, verify termination protection, validate world/player identity through SSM and a test client, and keep the old volume until acceptance. Delete or archive it later only through a separate explicit decision.
 
 For a brand-new environment with no current volume, setting `data_volume_snapshot_id` before first creation is sufficient and initialization permission remains false.
 

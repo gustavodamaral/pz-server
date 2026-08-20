@@ -213,12 +213,17 @@ function Send-PZSsmCommand {
 
         [string] $Profile,
         [int] $TimeoutSeconds = 900,
+        [ValidateRange(30, 2592000)]
+        [int] $DeliveryTimeoutSeconds = 600,
         [string] $Comment = 'pz-server management command'
     )
 
     $parameterPath = [System.IO.Path]::GetTempFileName()
     try {
-        $parameters = @{ commands = @($Command) } | ConvertTo-Json -Compress
+        $parameters = @{
+            commands = @($Command)
+            executionTimeout = @($TimeoutSeconds.ToString())
+        } | ConvertTo-Json -Compress
         [System.IO.File]::WriteAllText(
             $parameterPath,
             $parameters,
@@ -230,7 +235,7 @@ function Send-PZSsmCommand {
             '--instance-ids', $InstanceId,
             '--document-name', 'AWS-RunShellScript',
             '--comment', $Comment,
-            '--timeout-seconds', $TimeoutSeconds.ToString(),
+            '--timeout-seconds', $DeliveryTimeoutSeconds.ToString(),
             '--parameters', $parameterUri
         )
         return [string] $response.Command.CommandId
