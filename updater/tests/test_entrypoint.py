@@ -48,6 +48,8 @@ def _fake_runtime(tmp_path: Path, readiness_exit: int) -> tuple[Path, dict[str, 
     environment = os.environ | {
         "PATH": f"{commands}:{os.environ['PATH']}",
         "PZ_SERVER_NAME": "test",
+        "ADMIN_USERNAME": "admin",
+        "ADMIN_PASSWORD": "test-password",
         "PZ_XMS": "2g",
         "PZ_XMX": "6g",
         "ZOMBOID_DIR": str(zombied),
