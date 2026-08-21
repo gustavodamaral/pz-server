@@ -83,5 +83,5 @@ WORKDIR /opt/pzserver
 EXPOSE 16261/udp 16262/udp 27015/tcp
 
 STOPSIGNAL SIGTERM
-HEALTHCHECK --interval=30s --timeout=10s --start-period=2h --retries=5 CMD ["/usr/local/bin/pz-healthcheck"]
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60m --retries=5 CMD ["/usr/local/bin/pz-healthcheck"]
 ENTRYPOINT ["/usr/bin/tini", "-g", "--", "/usr/local/bin/pz-entrypoint"]

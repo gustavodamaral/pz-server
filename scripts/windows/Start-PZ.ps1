@@ -9,8 +9,8 @@ param(
     [string] $EnvironmentTag = 'production',
     [string] $NormalInstanceType = 'r7a.large',
     [string] $PartyInstanceType = 'm7a.xlarge',
-    [ValidateRange(30, 7200)]
-    [int] $ReadyTimeoutSeconds = 7200
+    [ValidateRange(30, 3600)]
+    [int] $ReadyTimeoutSeconds = 3600
 )
 
 Set-StrictMode -Version Latest

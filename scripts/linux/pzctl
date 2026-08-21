@@ -9,7 +9,7 @@ readonly ROLLBACK_WATCHDOG_VENV=/opt/pz-watchdog-venv.rollback
 readonly COMPOSE=(docker compose --project-directory "${PROJECT_DIRECTORY}" --file "${PROJECT_DIRECTORY}/compose.yaml" --env-file "${ENV_FILE}")
 readonly BACKUP_LOCK=/run/pz-server-backup.lock
 readonly DEPLOY_READY_TIMEOUT_SECONDS=1800
-readonly GAME_READY_TIMEOUT_SECONDS=7200
+readonly GAME_READY_TIMEOUT_SECONDS=3600
 readonly DEPLOY_STATE_DIRECTORY=/var/lib/pz-deploy
 readonly DEPLOYED_COMMIT_FILE="${DEPLOY_STATE_DIRECTORY}/deployed-commit"
 readonly PENDING_DEPLOYMENT_FILE="${DEPLOY_STATE_DIRECTORY}/deployment-pending"
@@ -495,8 +495,8 @@ wait_ready() {
         echo "Usage: pzctl wait-ready [--timeout N]" >&2
         return 64
     fi
-    (( timeout_seconds >= 30 && timeout_seconds <= 7200 )) \
-        || { echo "Readiness timeout must be between 30 and 7200 seconds." >&2; return 64; }
+    (( timeout_seconds >= 30 && timeout_seconds <= 3600 )) \
+        || { echo "Readiness timeout must be between 30 and 3600 seconds." >&2; return 64; }
     local deadline=$((SECONDS + timeout_seconds))
     acquire_lifecycle_lock_wait "${timeout_seconds}" || return
     local remaining=$((deadline - SECONDS))

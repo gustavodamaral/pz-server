@@ -49,7 +49,7 @@ The automated updater suite uses temporary releases and a fake Steam provider. I
 Require coverage for all of these cases:
 
 - Public App `380870` metadata and complete-manifest parsing; duplicate/missing fields fail closed.
-- Legacy flat-install inspection before migration and repository-pending suppression before any move.
+- Repository-pending suppression before a Steam metadata check.
 - No-update startup without backup/download, mod-blocked automatic policy, explicit retry of a rejected build, and downgrade refusal.
 - Isolated candidate rejection, interrupted download/promotion/activation cleanup, insufficient/failed backup behavior, and unchanged active pointer before world access.
 - Verified archive/checksum/retention behavior with at least two completed pre-update backups.

@@ -130,15 +130,8 @@ class Settings:
         if not password or password.startswith("change-me-"):
             raise ConfigurationError("RCON_PASSWORD must be set to a non-placeholder value")
 
-        update_policy = values.get("PZ_UPDATE_POLICY", "").strip()
-        if not update_policy:
-            update_policy = (
-                "stable-on-start"
-                if _boolean(values, "UPDATE_ON_START", False)
-                else "manual"
-                if "UPDATE_ON_START" in values
-                else "stable-on-start"
-            )
+        update_policy = values.get("PZ_UPDATE_POLICY", "stable-on-start").strip()
+        update_policy = update_policy or "stable-on-start"
         if update_policy not in {"stable-on-start", "manual"}:
             raise ConfigurationError("PZ_UPDATE_POLICY must be stable-on-start or manual")
         steam_branch = values.get("STEAM_BRANCH", "").strip()

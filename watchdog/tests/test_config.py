@@ -103,13 +103,6 @@ def test_invalid_dotenv_line_fails(tmp_path: Path) -> None:
         Settings.from_environment(environment(tmp_path, PZ_ENV_FILE=str(dotenv)))
 
 
-def test_legacy_update_setting_is_mapped_without_changing_behavior(tmp_path: Path) -> None:
-    disabled = Settings.from_environment(environment(tmp_path, UPDATE_ON_START="false"))
-    enabled = Settings.from_environment(environment(tmp_path, UPDATE_ON_START="true"))
-    assert disabled.update_policy == "manual"
-    assert enabled.update_policy == "stable-on-start"
-
-
 def test_stable_policy_rejects_non_public_branch(tmp_path: Path) -> None:
     with pytest.raises(ConfigurationError, match="empty STEAM_BRANCH"):
         Settings.from_environment(

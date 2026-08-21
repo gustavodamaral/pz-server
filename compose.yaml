@@ -27,7 +27,7 @@ services:
       PZ_PRE_UPDATE_BACKUP_RETENTION: ${PZ_PRE_UPDATE_BACKUP_RETENTION:-3}
       PZ_REPOSITORY_DEPLOYMENT_MARKER: /run/pz-deploy/deployment-pending
       PZ_SERVER_NAME: ${PZ_SERVER_NAME:-pzserver}
-      PZ_UPDATE_POLICY: ${PZ_UPDATE_POLICY:-}
+      PZ_UPDATE_POLICY: ${PZ_UPDATE_POLICY:-stable-on-start}
       PZ_XMS: ${PZ_XMS:-2g}
       PZ_XMX: ${PZ_XMX:-8g}
       RCON_PASSWORD: ${RCON_PASSWORD:?Set RCON_PASSWORD in .env}
@@ -40,9 +40,7 @@ services:
       STEAM_APP_ID: ${STEAM_APP_ID:-380870}
       STEAM_BRANCH: ${STEAM_BRANCH:-}
       STEAM_BRANCH_PASSWORD: ${STEAM_BRANCH_PASSWORD:-}
-      STEAM_VALIDATE: ${STEAM_VALIDATE:-false}
       TZ: ${TZ:-UTC}
-      UPDATE_ON_START: ${UPDATE_ON_START:-false}
       UPDATE_READINESS_TIMEOUT_SECONDS: ${UPDATE_READINESS_TIMEOUT_SECONDS:-1800}
       WORKSHOP_ITEMS: ${WORKSHOP_ITEMS:-}
     ports:
@@ -72,7 +70,7 @@ services:
       interval: 30s
       timeout: 10s
       retries: 5
-      start_period: 2h
+      start_period: 60m
     cap_drop:
       - ALL
     security_opt:
@@ -110,7 +108,7 @@ services:
       IDLE_TIMEOUT_MINUTES: ${IDLE_TIMEOUT_MINUTES:-45}
       POLL_INTERVAL_SECONDS: ${POLL_INTERVAL_SECONDS:-60}
       PZ_STATUS_SERVER_PATH: /status/server
-      PZ_UPDATE_POLICY: ${PZ_UPDATE_POLICY:-}
+      PZ_UPDATE_POLICY: ${PZ_UPDATE_POLICY:-stable-on-start}
       RCON_HOST: server
       RCON_PASSWORD: ${RCON_PASSWORD:?Set RCON_PASSWORD in .env}
       RCON_PORT: ${RCON_PORT:-27015}

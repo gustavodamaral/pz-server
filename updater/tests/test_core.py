@@ -15,7 +15,6 @@ import pytest
 from pz_updater.core import (
     ACTIVE_RELEASE_FILE,
     PREVIOUS_RELEASE_FILE,
-    REPOSITORY_DEPLOYMENT_MARKER,
     STATE_FILE,
     BackupManager,
     GameUpdater,
@@ -115,7 +114,7 @@ def configuration(
         pz_xms="2g",
         pz_xmx="6g",
         deployment_environment=deployment_environment,
-        repository_deployment_marker=install_root / REPOSITORY_DEPLOYMENT_MARKER,
+        repository_deployment_marker=tmp_path / "deployment-pending",
     )
 
 
@@ -140,6 +139,12 @@ class FakeSteam:
         build = self.installed_build if self.installed_build is not None else self.latest
         assert isinstance(build, int)
         write_release(destination, build)
+
+
+class IncompatibleSteam(FakeSteam):
+    def install(self, destination: Path, branch: str, branch_password: str, validate: bool) -> None:
+        super().install(destination, branch, branch_password, validate)
+        (destination / "ProjectZomboid64.json").write_text("{}", encoding="utf-8")
 
 
 @dataclass
@@ -186,25 +191,13 @@ def updater(
     return result
 
 
-def test_configuration_defaults_to_stable_and_migrates_legacy_flag(tmp_path: Path) -> None:
+def test_configuration_defaults_to_stable(tmp_path: Path) -> None:
     base = {
         "PZ_INSTALL_ROOT": str(tmp_path / "install"),
         "ZOMBOID_DIR": str(tmp_path / "data"),
         "PZ_BACKUP_DIR": str(tmp_path / "backups"),
     }
     assert UpdateConfiguration.from_environment(base).policy is UpdatePolicy.STABLE_ON_START
-    assert (
-        UpdateConfiguration.from_environment({**base, "UPDATE_ON_START": "false"}).policy
-        is UpdatePolicy.MANUAL
-    )
-    assert (
-        UpdateConfiguration.from_environment({**base, "UPDATE_ON_START": "true"}).policy
-        is UpdatePolicy.STABLE_ON_START
-    )
-    explicit = UpdateConfiguration.from_environment(
-        {**base, "PZ_UPDATE_POLICY": "stable-on-start", "UPDATE_ON_START": "false"}
-    )
-    assert explicit.policy is UpdatePolicy.STABLE_ON_START
 
 
 @pytest.mark.parametrize(
@@ -378,7 +371,7 @@ def test_steam_candidate_command_is_explicit(
     def fake_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
         assert command[-len(expected_tail) :] == expected_tail
         assert command[1:3] == ["+force_install_dir", str(tmp_path)]
-        assert kwargs["timeout"] == 6300
+        assert kwargs["timeout"] == 3300
         return subprocess.CompletedProcess(command, 0, "", "")
 
     monkeypatch.setattr(subprocess, "run", fake_run)
@@ -494,46 +487,15 @@ def test_backup_requires_an_existing_data_tree(tmp_path: Path) -> None:
         BackupManager(tmp_path / "missing", tmp_path / "backups", 2).create(100, 200)
 
 
-def test_repository_marker_suppresses_migration_and_metadata_query(tmp_path: Path) -> None:
+def test_repository_marker_suppresses_metadata_query(tmp_path: Path) -> None:
     config = configuration(tmp_path)
-    write_release(config.install_root, 100)
+    active = select_release(config, 100)
     config.repository_deployment_marker.touch()
     steam = FakeSteam(200)
     state = updater(config, steam).prepare_start()
     assert state["last_result"] == "repository-deploy-suppressed"
     assert not steam.latest_calls
-    assert (config.install_root / "start-server.sh").exists()
-    assert not (config.install_root / ACTIVE_RELEASE_FILE).exists()
-    assert not (config.install_root / "releases").exists()
-
-
-def test_flat_install_migrates_only_after_structural_inspection(tmp_path: Path) -> None:
-    config = configuration(tmp_path, policy=UpdatePolicy.MANUAL)
-    write_release(config.install_root, 100)
-    steam = FakeSteam(200)
-    target = updater(config, steam)
-    state = target.prepare_start()
-    active = target.active_release()
-    assert active.parent == config.install_root / "releases"
-    assert not (config.install_root / "start-server.sh").exists()
-    assert state["last_result"] == "manual-policy"
-    assert not steam.latest_calls
-    document = json.loads((active / "ProjectZomboid64.json").read_text(encoding="utf-8"))
-    assert "-Xms2g" in document["vmArgs"]
-    assert "-Xmx6g" in document["vmArgs"]
-
-
-def test_invalid_flat_install_is_not_moved_or_mutated(tmp_path: Path) -> None:
-    config = configuration(tmp_path, policy=UpdatePolicy.MANUAL)
-    write_release(config.install_root, 100)
-    original = (config.install_root / "ProjectZomboid64.json").read_bytes()
-    with (config.install_root / "start-server.sh").open("a", encoding="utf-8") as stream:
-        stream.write('./ProjectZomboid64 "$@"\n')
-    with pytest.raises(UpdateError, match="ambiguous"):
-        updater(config, FakeSteam(100)).prepare_start()
-    assert (config.install_root / "start-server.sh").exists()
-    assert (config.install_root / "ProjectZomboid64.json").read_bytes() == original
-    assert not (config.install_root / ACTIVE_RELEASE_FILE).exists()
+    assert updater(config, steam).active_release() == active
 
 
 def test_no_update_starts_current_release_without_backup(tmp_path: Path) -> None:
@@ -615,7 +577,7 @@ def test_acceptance_before_runtime_readiness_is_a_noop(tmp_path: Path) -> None:
     assert target.accept()["state"] == "pending-readiness"
 
 
-def test_candidate_failure_starts_known_good_and_explicit_retry_is_allowed(
+def test_download_failure_does_not_block_a_future_automatic_retry(
     tmp_path: Path,
 ) -> None:
     config = configuration(tmp_path)
@@ -624,13 +586,27 @@ def test_candidate_failure_starts_known_good_and_explicit_retry_is_allowed(
     target = updater(config, steam)
     failed = target.prepare_start()
     assert failed["state"] == "failed-before-world-open"
-    assert failed["blocked_build"] == 200
+    assert failed["blocked_build"] is None
     assert target.active_release() == old
     assert not list((config.install_root / "releases").glob(".candidate-*"))
     steam.install_error = None
-    retried = target.explicit_update()
+    retried = target.prepare_start()
     assert retried["state"] == "pending-readiness"
     assert read_installed_metadata(target.active_release(), 380870).build_id == 200
+
+
+def test_deterministic_launcher_incompatibility_blocks_the_build(tmp_path: Path) -> None:
+    config = configuration(tmp_path)
+    old = select_release(config, 100)
+    steam = IncompatibleSteam(200)
+    target = updater(config, steam)
+    failed = target.prepare_start()
+    assert failed["last_result"] == "candidate-incompatible"
+    assert failed["blocked_build"] == 200
+    assert target.active_release() == old
+    repeated = target.prepare_start()
+    assert repeated["blocked_build"] == 200
+    assert len(steam.install_calls) == 1
 
 
 def test_candidate_space_failure_starts_known_good_and_is_recorded(tmp_path: Path) -> None:
@@ -645,6 +621,7 @@ def test_candidate_space_failure_starts_known_good_and_is_recorded(tmp_path: Pat
     state = target.prepare_start()
     assert state["last_result"] == "update-precondition-failed"
     assert "insufficient" in str(state["detail"])
+    assert state["blocked_build"] is None
     assert target.active_release() == old
 
 
@@ -675,6 +652,7 @@ def test_backup_failure_never_changes_active_release(tmp_path: Path) -> None:
     target = updater(config, FakeSteam(200), backup)
     failed = target.prepare_start()
     assert failed["last_result"] == "backup-failed"
+    assert failed["blocked_build"] is None
     assert target.active_release() == old
     assert read_installed_metadata(old, 380870).build_id == 100
 
@@ -701,7 +679,7 @@ def test_mods_block_automatic_update_but_not_current_start(tmp_path: Path) -> No
     assert (config.install_root / old.relative_to(config.install_root)).exists()
 
 
-def test_interrupted_download_is_cleaned_and_blocked(tmp_path: Path) -> None:
+def test_interrupted_download_is_cleaned_without_blocking_future_retry(tmp_path: Path) -> None:
     config = configuration(tmp_path)
     old = select_release(config, 100)
     candidate = write_release(config.install_root / "releases" / ".candidate-200-test", 200)
@@ -713,12 +691,12 @@ def test_interrupted_download_is_cleaned_and_blocked(tmp_path: Path) -> None:
             "candidate_release": "releases/.candidate-200-test",
         }
     )
-    state = updater(config, FakeSteam(200)).prepare_start()
-    assert state["last_result"] == "candidate-interrupted"
+    target = updater(config, FakeSteam(200))
+    state = target.prepare_start()
+    assert state["last_result"] == "candidate-activated"
+    assert state["blocked_build"] is None
     assert not candidate.exists()
-    assert (config.install_root / ACTIVE_RELEASE_FILE).read_text().strip() == (
-        f"releases/{old.name}"
-    )
+    assert target.active_release() != old
 
 
 def test_interrupted_initial_install_is_retried_because_no_release_exists(tmp_path: Path) -> None:
@@ -782,12 +760,11 @@ def test_interrupted_activation_discards_unselected_candidate(tmp_path: Path) ->
             "world_opened": False,
         }
     )
-    state = updater(config, FakeSteam(200)).prepare_start()
-    assert state["last_result"] == "activation-failed"
+    target = updater(config, FakeSteam(200))
+    state = target.prepare_start()
+    assert state["last_result"] == "candidate-activated"
     assert not candidate.exists()
-    assert (config.install_root / ACTIVE_RELEASE_FILE).read_text().strip() == (
-        f"releases/{old.name}"
-    )
+    assert target.active_release() != old
 
 
 def test_readiness_failure_after_world_open_never_rolls_back(tmp_path: Path) -> None:

@@ -59,48 +59,6 @@ set_managed_environment_value() {
     fi
 }
 
-ensure_environment_value() {
-    local key="$1"
-    local value="$2"
-    local count
-    count="$(grep --count -- "^${key}=" "${ENV_FILE}" || true)"
-    if [[ ! "${count}" =~ ^[0-9]+$ ]] || (( count > 1 )); then
-        die "${ENV_FILE} must contain at most one ${key} entry."
-    fi
-    if (( count == 0 )); then
-        set_managed_environment_value "${key}" "${value}"
-    fi
-}
-
-migrate_update_environment() {
-    local policy_count legacy_count legacy_value policy
-    policy_count="$(grep --count -- '^PZ_UPDATE_POLICY=' "${ENV_FILE}" || true)"
-    if [[ ! "${policy_count}" =~ ^[0-9]+$ ]] || (( policy_count > 1 )); then
-        die "${ENV_FILE} must contain at most one PZ_UPDATE_POLICY entry."
-    fi
-    if (( policy_count == 0 )); then
-        legacy_count="$(grep --count -- '^UPDATE_ON_START=' "${ENV_FILE}" || true)"
-        if [[ ! "${legacy_count}" =~ ^[0-9]+$ ]] || (( legacy_count > 1 )); then
-            die "${ENV_FILE} must contain at most one UPDATE_ON_START entry."
-        fi
-        policy=manual
-        if (( legacy_count == 1 )); then
-            legacy_value="$(sed -n 's/^UPDATE_ON_START=//p' "${ENV_FILE}")"
-            case "${legacy_value,,}" in
-                1|true|yes|on) policy=stable-on-start ;;
-                0|false|no|off) policy=manual ;;
-                *) die "Existing UPDATE_ON_START must be a boolean before migration." ;;
-            esac
-        fi
-        set_managed_environment_value PZ_UPDATE_POLICY "${policy}"
-        log INFO "Migrated legacy update behavior to PZ_UPDATE_POLICY=${policy}."
-    fi
-    ensure_environment_value ALLOW_AUTO_UPDATE_WITH_MODS false
-    ensure_environment_value PZ_PRE_UPDATE_BACKUP_RETENTION 3
-    ensure_environment_value PZ_PRE_UPDATE_BACKUP_PATH "${PZ_DATA_ROOT}/backups/pre-update"
-    ensure_environment_value UPDATE_READINESS_TIMEOUT_SECONDS 7200
-}
-
 install_rcon_cli() {
     local architecture archive_arch checksum archive
     if command -v rcon-cli >/dev/null 2>&1; then
@@ -131,7 +89,6 @@ create_environment() {
         chmod 0600 "${ENV_FILE}"
         chown root:root "${ENV_FILE}"
         set_managed_environment_value RESTART_POLICY no
-        migrate_update_environment
         log INFO "Preserving existing production secrets at ${ENV_FILE}."
         return
     fi
@@ -152,7 +109,7 @@ STEAM_BRANCH_PASSWORD=
 PZ_UPDATE_POLICY=stable-on-start
 ALLOW_AUTO_UPDATE_WITH_MODS=false
 PZ_PRE_UPDATE_BACKUP_RETENTION=3
-UPDATE_READINESS_TIMEOUT_SECONDS=7200
+UPDATE_READINESS_TIMEOUT_SECONDS=1800
 GAME_BIND_ADDRESS=0.0.0.0
 GAME_PORT=16261
 DIRECT_PORT=16262

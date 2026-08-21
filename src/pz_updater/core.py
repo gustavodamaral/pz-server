@@ -23,7 +23,6 @@ ACTIVE_RELEASE_FILE = "active-release"
 PREVIOUS_RELEASE_FILE = "previous-release"
 STATE_FILE = "update-state.json"
 TRANSACTION_LOCK_FILE = ".update-transaction.lock"
-REPOSITORY_DEPLOYMENT_MARKER = ".repository-deployment-pending"
 RELEASES_DIRECTORY = "releases"
 ANSI_ESCAPE_PATTERN = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 PLAYER_HEADER_PATTERNS = (
@@ -38,6 +37,10 @@ VERSION_PATTERN = re.compile(
 
 class UpdateError(RuntimeError):
     """An update could not proceed without violating a safety invariant."""
+
+
+class CandidateIncompatibility(UpdateError):
+    """A complete candidate cannot satisfy the supported launcher contract."""
 
 
 class UpdatePolicy(StrEnum):
@@ -102,16 +105,9 @@ class UpdateConfiguration:
     @classmethod
     def from_environment(cls, environment: Mapping[str, str] | None = None) -> UpdateConfiguration:
         values = dict(os.environ if environment is None else environment)
-        policy_raw = values.get("PZ_UPDATE_POLICY", "").strip()
+        policy_raw = values.get("PZ_UPDATE_POLICY", UpdatePolicy.STABLE_ON_START.value).strip()
         if not policy_raw:
-            if "UPDATE_ON_START" in values:
-                policy_raw = (
-                    UpdatePolicy.STABLE_ON_START.value
-                    if _boolean(values, "UPDATE_ON_START", False)
-                    else UpdatePolicy.MANUAL.value
-                )
-            else:
-                policy_raw = UpdatePolicy.STABLE_ON_START.value
+            policy_raw = UpdatePolicy.STABLE_ON_START.value
         try:
             policy = UpdatePolicy(policy_raw)
         except ValueError as error:
@@ -430,7 +426,7 @@ class SteamClient:
             command.append("validate")
         command.append("+quit")
         try:
-            result = subprocess.run(command, check=False, timeout=6300)
+            result = subprocess.run(command, check=False, timeout=3300)
         except (OSError, subprocess.TimeoutExpired) as error:
             raise UpdateError(
                 f"Steam candidate installation failed: {type(error).__name__}"
@@ -454,9 +450,12 @@ class LauncherValidator:
         self.syntax_checker = syntax_checker or self._check_bash_syntax
 
     def prepare(self, release: Path, xms: str, xmx: str) -> SteamBuildMetadata:
-        metadata, launcher_json, wrapper, launcher_mode, wrapper_mode = self._inspect(
-            release, xms, xmx
-        )
+        try:
+            metadata, launcher_json, wrapper, launcher_mode, wrapper_mode = self._inspect(
+                release, xms, xmx
+            )
+        except UpdateError as error:
+            raise CandidateIncompatibility(str(error)) from error
         temporary_wrapper = self._validated_wrapper(release, wrapper, wrapper_mode)
         try:
             atomic_write(release / "ProjectZomboid64.json", launcher_json, mode=launcher_mode)
@@ -467,7 +466,10 @@ class LauncherValidator:
         return metadata
 
     def inspect(self, release: Path, xms: str, xmx: str) -> SteamBuildMetadata:
-        metadata, _, wrapper, _, wrapper_mode = self._inspect(release, xms, xmx)
+        try:
+            metadata, _, wrapper, _, wrapper_mode = self._inspect(release, xms, xmx)
+        except UpdateError as error:
+            raise CandidateIncompatibility(str(error)) from error
         temporary_wrapper = self._validated_wrapper(release, wrapper, wrapper_mode)
         temporary_wrapper.unlink(missing_ok=True)
         return metadata
@@ -739,7 +741,6 @@ class ReleaseLayout:
         ACTIVE_RELEASE_FILE,
         PREVIOUS_RELEASE_FILE,
         RELEASES_DIRECTORY,
-        REPOSITORY_DEPLOYMENT_MARKER,
         STATE_FILE,
         TRANSACTION_LOCK_FILE,
     }
@@ -778,52 +779,10 @@ class ReleaseLayout:
             return
         atomic_write(path, self.relative(release) + "\n", mode=0o640)
 
-    def ensure(self, launcher: LauncherValidator, xms: str, xmx: str) -> Path | None:
+    def ensure(self) -> Path | None:
         self.root.mkdir(parents=True, exist_ok=True)
         self.releases.mkdir(parents=True, exist_ok=True)
-        active = self.active()
-        if active is not None:
-            return active
-        state = self.state_store.load()
-        migration_relative = state.get("migration_release")
-        if state.get("state") == "migrating-flat-install" and isinstance(migration_relative, str):
-            if not re.fullmatch(r"releases/[A-Za-z0-9._-]+", migration_relative):
-                raise UpdateError("Flat-install migration release is malformed")
-            destination = self.root / migration_relative
-            self.relative(destination)
-        elif (self.root / "start-server.sh").is_file():
-            metadata = launcher.inspect(self.root, xms, xmx)
-            destination = self._unique_release(f"steam-{metadata.build_id}-imported")
-            destination.mkdir()
-            state = self.state_store.write(
-                {
-                    **state,
-                    "state": "migrating-flat-install",
-                    "migration_release": self.relative(destination),
-                    "current_build": metadata.build_id,
-                    "updated_at": utc_now(),
-                }
-            )
-        else:
-            return None
-        destination.mkdir(parents=True, exist_ok=True)
-        for entry in list(self.root.iterdir()):
-            if entry.name in self.MANAGED_ROOT_NAMES:
-                continue
-            os.replace(entry, destination / entry.name)
-        metadata = launcher.prepare(destination, xms, xmx)
-        self.write_active(destination)
-        self.state_store.write(
-            {
-                **state,
-                "state": "current",
-                "current_build": metadata.build_id,
-                "last_result": "imported-existing-installation",
-                "migration_release": None,
-                "updated_at": utc_now(),
-            }
-        )
-        return destination
+        return self.active()
 
     def unique_candidate(self, build_id: int) -> Path:
         return self.releases / f".candidate-{build_id}-{uuid.uuid4().hex[:12]}"
@@ -941,24 +900,16 @@ class GameUpdater:
                 )
                 return state
             if self.configuration.repository_deployment_marker.exists():
-                selected = active
-                if (
-                    selected is None
-                    and (self.configuration.install_root / "start-server.sh").is_file()
-                ):
-                    selected = self.configuration.install_root
-                if selected is None:
+                if active is None:
                     raise UpdateError(
                         "Repository deployment suppressed updates but no game release exists"
                     )
-                current = read_installed_metadata(selected, self.configuration.app_id)
+                current = read_installed_metadata(active, self.configuration.app_id)
                 LOGGER.info(
                     "Repository deployment is pending; game update and migration are suppressed."
                 )
                 return self._write_observation(state, current, "repository-deploy-suppressed")
-            active = self.layout.ensure(
-                self.launcher, self.configuration.pz_xms, self.configuration.pz_xmx
-            )
+            active = self.layout.ensure()
             state = self.state_store.load()
             active = self.layout.active() or active
             if active is not None:
@@ -1023,9 +974,7 @@ class GameUpdater:
             state = self._recover_interrupted(self.state_store.load())
             if self.configuration.repository_deployment_marker.exists():
                 raise UpdateError("Repository deployment is pending; explicit game update refused")
-            active = self.layout.ensure(
-                self.launcher, self.configuration.pz_xms, self.configuration.pz_xmx
-            )
+            active = self.layout.ensure()
             state = self.state_store.load()
             if state.get("state") in self.CANDIDATE_STATES:
                 raise UpdateError(
@@ -1043,8 +992,6 @@ class GameUpdater:
 
     def active_release(self) -> Path:
         active = self.layout.active()
-        if active is None and (self.configuration.install_root / "start-server.sh").is_file():
-            active = self.configuration.install_root
         if active is None:
             raise UpdateError("No active Project Zomboid release is selected")
         return active
@@ -1141,8 +1088,6 @@ class GameUpdater:
     def status(self) -> dict[str, object]:
         state = self.state_store.load()
         active = self.layout.active()
-        if active is None and (self.configuration.install_root / "start-server.sh").is_file():
-            active = self.configuration.install_root
         if active is not None:
             try:
                 metadata = read_installed_metadata(active, self.configuration.app_id)
@@ -1284,21 +1229,39 @@ class GameUpdater:
                 self.configuration.branch_password,
                 validate,
             )
+        except Exception as error:
+            shutil.rmtree(candidate, ignore_errors=True)
+            detail = str(error) if isinstance(error, UpdateError) else type(error).__name__
+            self._record_pre_world_failure(
+                state, current, latest, "candidate-download-failed", detail
+            )
+            if isinstance(error, UpdateError):
+                raise
+            raise UpdateError(f"Candidate installation failed: {detail}") from error
+        try:
             candidate_metadata = self.launcher.prepare(
                 candidate, self.configuration.pz_xms, self.configuration.pz_xmx
             )
             if candidate_metadata.build_id != latest:
-                raise UpdateError(
+                raise CandidateIncompatibility(
                     f"Candidate manifest build {candidate_metadata.build_id} "
                     f"does not match expected {latest}"
                 )
+        except CandidateIncompatibility as error:
+            shutil.rmtree(candidate, ignore_errors=True)
+            self._record_pre_world_failure(
+                state, current, latest, "candidate-incompatible", str(error), block=True
+            )
+            raise
         except Exception as error:
             shutil.rmtree(candidate, ignore_errors=True)
             detail = str(error) if isinstance(error, UpdateError) else type(error).__name__
-            self._record_pre_world_failure(state, current, latest, "candidate-rejected", detail)
+            self._record_pre_world_failure(
+                state, current, latest, "candidate-validation-failed", detail
+            )
             if isinstance(error, UpdateError):
                 raise
-            raise UpdateError(f"Candidate installation failed: {detail}") from error
+            raise UpdateError(f"Candidate validation failed: {detail}") from error
         LOGGER.info(
             "Project Zomboid update detected: %s -> %s",
             current.build_id if current else "none",
@@ -1407,7 +1370,7 @@ class GameUpdater:
                 "state": "failed-before-world-open",
                 "candidate_release": None,
                 "promoted_release": None,
-                "blocked_build": state.get("candidate_build"),
+                "blocked_build": None,
                 "last_result": "candidate-interrupted",
                 "detail": "Candidate preparation was interrupted before activation",
                 "updated_at": utc_now(),
@@ -1448,7 +1411,7 @@ class GameUpdater:
                     "state": "failed-before-world-open",
                     "candidate_release": None,
                     "last_result": "activation-failed",
-                    "blocked_build": state.get("candidate_build"),
+                    "blocked_build": None,
                     "detail": "Activation was interrupted before the candidate became active",
                     "updated_at": utc_now(),
                 }
@@ -1481,6 +1444,7 @@ class GameUpdater:
         candidate: int | None,
         result: str,
         detail: str,
+        block: bool = False,
     ) -> dict[str, object]:
         return self.state_store.write(
             {
@@ -1490,7 +1454,7 @@ class GameUpdater:
                 "candidate_build": candidate,
                 "candidate_release": None,
                 "promoted_release": None,
-                "blocked_build": candidate,
+                "blocked_build": candidate if block else None,
                 "last_result": result,
                 "detail": detail[:500],
                 "last_check_at": utc_now(),

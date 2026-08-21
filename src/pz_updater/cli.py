@@ -76,8 +76,8 @@ def _query_players() -> int:
 def _wait_runtime_ready(args: argparse.Namespace, updater: GameUpdater) -> dict[str, object]:
     if args.pid <= 0:
         raise UpdateError("--pid must identify a positive process ID")
-    if not 30 <= args.timeout <= 7200:
-        raise UpdateError("--timeout must be between 30 and 7200 seconds")
+    if not 30 <= args.timeout <= 3600:
+        raise UpdateError("--timeout must be between 30 and 3600 seconds")
     log_path = Path(args.log)
     deadline = time.monotonic() + args.timeout
     last_detail = "RCON has not been queried"

@@ -23,7 +23,7 @@ docker compose exec -T server pz-updater status
 
 ## Container Is Unhealthy
 
-Docker health requires the Java GameServer process and is deliberately independent of RCON. The readiness command separately requires process health, exact RCON, update acceptance, and an active AWS watchdog. During a bounded candidate download/start, container health remains `starting` for up to two hours so the watchdog cannot mistake a legitimate Steam transaction for a management outage. The systemd start wrapper holds the shared lifecycle lock throughout this phase.
+Docker health requires the Java GameServer process and is deliberately independent of RCON. The readiness command separately requires process health, exact RCON, update acceptance, and an active AWS watchdog. During a bounded candidate download/start, container health remains `starting` for up to 60 minutes so the watchdog cannot mistake a legitimate Steam transaction for a management outage. The systemd start wrapper holds the shared lifecycle lock throughout this phase.
 
 ```powershell
 docker compose ps

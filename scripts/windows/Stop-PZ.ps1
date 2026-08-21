@@ -51,8 +51,27 @@ else {
         throw 'SSM is not online. Refusing an implicit hard stop; investigate or rerun with the explicit -Force switch.'
     }
     Write-Host 'Requesting RCON save, graceful container stop, and guest Linux poweroff through SSM.'
+    $stackStateCommand = 'systemctl show --property=ActiveState --value pz-stack.service'
+    $stackStateId = Send-PZSsmCommand `
+        -InstanceId $instanceId `
+        -Region $Region `
+        -Profile $Profile `
+        -TimeoutSeconds 30 `
+        -DeliveryTimeoutSeconds 30 `
+        -Comment 'Inspect Project Zomboid startup state' `
+        -Command $stackStateCommand
+    $stackState = ([string] (Wait-PZSsmCommand `
+        -CommandId $stackStateId `
+        -InstanceId $instanceId `
+        -Region $Region `
+        -Profile $Profile `
+        -TimeoutSeconds 60).StandardOutputContent).Trim()
     $shutdownCommand = '/usr/local/bin/pzctl shutdown-host'
-    if ($AllowConnectedPlayers) {
+    if ($stackState -eq 'activating') {
+        Write-Host 'Cancelling in-progress PZ startup before guest poweroff.'
+        $shutdownCommand = 'systemctl stop pz-watchdog.service pz-stack.service && systemctl poweroff'
+    }
+    elseif ($AllowConnectedPlayers) {
         Write-Warning 'Connected-player protection was explicitly disabled for this graceful maintenance stop.'
         $shutdownCommand += ' --allow-connected-players'
     }

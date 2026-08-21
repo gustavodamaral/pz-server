@@ -39,7 +39,7 @@ The current official `start-server.sh` ends with unconditional `exit 0`, which m
 
 ## Game Update Transaction
 
-Repository deployment and Steam game updating are separate release streams. `/var/lib/pz-deploy/deployment-pending` is root-owned and mounted read-only into the game container. Its presence suppresses Steam checks and legacy flat-layout migration before a target or rollback starts. Once `active-release` exists, repository preflight refuses commits that cannot understand managed releases.
+Repository deployment and Steam game updating are separate release streams. `/var/lib/pz-deploy/deployment-pending` is root-owned and mounted read-only into the game container. Its presence suppresses Steam checks before a target or rollback starts.
 
 `PZ_UPDATE_POLICY=stable-on-start` checks Steam's `public` branch only before a gameplay session. `manual` performs no metadata query for an existing release. Explicit non-public branches require `manual`; configured mods block automatic updates unless separately authorized. There is no timer, external poller, automatic downgrade, or update of a running Java process.
 
@@ -52,7 +52,7 @@ The transaction is:
 5. Promote the candidate and atomically replace text pointers only after durable transaction state records old/new builds and the verified backup.
 6. Immediately before candidate launch, persist `world_opened=true`. Exact local RCON plus process health records runtime readiness; AWS additionally requires host/watchdog acceptance.
 
-Failures before world access retain or reselect the known-good release and block the rejected build from repeated automatic attempts. Interrupted downloads/promotions are cleaned from explicit state. After `world_opened=true`, failure is `failed-after-world-open`; the candidate remains selected and automation never starts older binaries against possibly migrated world data. Recovery then requires release notes, logs, a maintenance stop, and an explicit decision to continue forward or restore a compatible world backup.
+Failures before world access retain or reselect the known-good release. Only a deterministic launcher/candidate incompatibility blocks that exact build from repeated automatic attempts; transient Steam, disk, backup, and interruption failures retry on a future start. After `world_opened=true`, failure is `failed-after-world-open`; the candidate is stopped but remains selected and automation never starts older binaries against possibly migrated world data. Recovery then requires release notes, logs, a maintenance stop, and an explicit decision to continue forward or restore a compatible world backup.
 
 ## Configuration Merge
 

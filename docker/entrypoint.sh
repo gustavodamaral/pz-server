@@ -65,12 +65,10 @@ validate_environment() {
     : "${DIRECT_PORT:=16262}"
     : "${RCON_PORT:=27015}"
     : "${STEAM_APP_ID:=380870}"
-    : "${PZ_UPDATE_POLICY:=}"
+    : "${PZ_UPDATE_POLICY:=stable-on-start}"
     : "${ALLOW_AUTO_UPDATE_WITH_MODS:=false}"
     : "${PZ_PRE_UPDATE_BACKUP_RETENTION:=3}"
     : "${PZ_BACKUP_DIR:=/backups}"
-    : "${UPDATE_ON_START:=false}"
-    : "${STEAM_VALIDATE:=false}"
     : "${UPDATE_READINESS_TIMEOUT_SECONDS:=1800}"
     : "${DEPLOYMENT_ENVIRONMENT:=local}"
     : "${PZ_XMS:=2g}"
@@ -101,7 +99,7 @@ validate_environment() {
     require_integer RCON_PORT 1024 65535
     require_integer STEAM_APP_ID 1 2147483647
     require_integer PZ_PRE_UPDATE_BACKUP_RETENTION 2 20
-    require_integer UPDATE_READINESS_TIMEOUT_SECONDS 30 7200
+    require_integer UPDATE_READINESS_TIMEOUT_SECONDS 30 3600
     require_integer SHUTDOWN_SAVE_SECONDS 0 30
     require_integer SHUTDOWN_GRACE_SECONDS 30 90
     [[ "${GAME_PORT}" != "${DIRECT_PORT}" ]] || die "GAME_PORT and DIRECT_PORT must differ."
@@ -110,16 +108,12 @@ validate_environment() {
         || die "SHUTDOWN_SAVE_SECONDS plus SHUTDOWN_GRACE_SECONDS must not exceed 110."
     [[ "${STEAM_APP_ID}" == 380870 ]] || die "Only dedicated-server Steam App 380870 is supported."
     case "${PZ_UPDATE_POLICY}" in
-        ""|stable-on-start|manual) ;;
+        stable-on-start|manual) ;;
         *) die "PZ_UPDATE_POLICY must be stable-on-start or manual." ;;
     esac
     [[ "${DEPLOYMENT_ENVIRONMENT}" == local || "${DEPLOYMENT_ENVIRONMENT}" == aws ]] \
         || die "DEPLOYMENT_ENVIRONMENT must be local or aws."
     is_true "${ALLOW_AUTO_UPDATE_WITH_MODS}" || true
-    is_true "${UPDATE_ON_START}" || true
-    if is_true "${STEAM_VALIDATE}"; then
-        die "STEAM_VALIDATE is no longer automatic; use the explicit pzctl update --validate repair path."
-    fi
 
     require_secret ADMIN_PASSWORD
     require_secret RCON_PASSWORD
@@ -140,7 +134,7 @@ prepare_release() {
     [[ -n "${selected_release}" && "${selected_release}" != *$'\n'* ]] \
         || die "Updater returned an ambiguous active release path."
     case "${selected_release}" in
-        "${PZ_SERVER_DIR}"|"${PZ_SERVER_DIR}"/releases/*) ;;
+        "${PZ_SERVER_DIR}"/releases/*) ;;
         *) die "Updater selected a release outside ${PZ_SERVER_DIR}." ;;
     esac
     [[ -x "${selected_release}/.pz-start-server.sh" ]] \
@@ -283,25 +277,64 @@ run_server() {
         --timeout "${UPDATE_READINESS_TIMEOUT_SECONDS}" &
     readiness_pid=$!
 
-    local status=0 final_status
-    wait "${server_pid}" || status=$?
-    if [[ "${shutdown_requested}" == true ]]; then
+    local status=0 final_status completed_pid="" readiness_failed=false
+    while [[ -n "${server_pid}" && -n "${readiness_pid}" ]]; do
+        completed_pid=""
+        if wait -n -p completed_pid "${server_pid}" "${readiness_pid}"; then
+            status=0
+        else
+            status=$?
+        fi
+        if [[ "${shutdown_requested}" == true ]]; then
+            graceful_shutdown
+            final_status=0
+            wait "${server_pid}" || final_status=$?
+            if (( final_status != 127 )); then
+                status="${final_status}"
+            fi
+            kill -TERM "${readiness_pid}" 2>/dev/null || true
+            wait "${readiness_pid}" 2>/dev/null || true
+            readiness_pid=""
+            break
+        fi
+        if [[ "${completed_pid}" == "${readiness_pid}" ]]; then
+            readiness_pid=""
+            if (( status != 0 )); then
+                log ERROR "Runtime readiness failed; stopping the current candidate without rollback."
+                readiness_failed=true
+                graceful_shutdown
+                final_status=0
+                wait "${server_pid}" || final_status=$?
+                (( final_status != 127 && final_status != 0 )) && status="${final_status}"
+                (( status == 0 )) && status=1
+            fi
+            break
+        fi
+        if [[ "${completed_pid}" == "${server_pid}" ]]; then
+            server_pid=""
+            kill -TERM "${readiness_pid}" 2>/dev/null || true
+            wait "${readiness_pid}" 2>/dev/null || true
+            readiness_pid=""
+            pz-updater fail-readiness --detail "Project Zomboid exited before runtime readiness" >/dev/null \
+                || log ERROR "Could not record the pre-readiness server exit."
+            break
+        fi
+    done
+    if [[ -n "${server_pid}" && "${shutdown_requested}" != true ]]; then
+        wait "${server_pid}" || status=$?
+    fi
+    if [[ "${shutdown_requested}" == true && -n "${server_pid}" ]]; then
         graceful_shutdown
         final_status=0
         wait "${server_pid}" || final_status=$?
-        # 127 means the first wait already reaped the child; retain that status.
         if (( final_status != 127 )); then
             status="${final_status}"
         fi
-    fi
-    if [[ -n "${readiness_pid}" ]]; then
-        if [[ "${shutdown_requested}" == true ]]; then
+        if [[ -n "${readiness_pid}" ]]; then
             kill -TERM "${readiness_pid}" 2>/dev/null || true
             wait "${readiness_pid}" 2>/dev/null || true
-        elif ! wait "${readiness_pid}"; then
-            log ERROR "Runtime readiness was not accepted; inspect pz-updater status before recovery."
+            readiness_pid=""
         fi
-        readiness_pid=""
     fi
     rm -f "${PID_FILE}" "${CONSOLE_FIFO}"
     exec 3>&-
@@ -314,6 +347,10 @@ run_server() {
         fi
         log INFO "Project Zomboid stopped after a graceful shutdown request."
         return 0
+    fi
+    if [[ "${readiness_failed}" == true ]]; then
+        log ERROR "Project Zomboid was stopped because runtime readiness failed."
+        return "${status}"
     fi
     if (( status != 0 )); then
         log ERROR "Project Zomboid exited unexpectedly with status ${status}."

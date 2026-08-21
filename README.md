@@ -239,7 +239,7 @@ On AWS, run `sudo pz-backup` through Session Manager. Its archive is on the same
 
 ## Updating Project Zomboid
 
-`PZ_UPDATE_POLICY=stable-on-start` is the default for new installations. An empty `STEAM_BRANCH` means Steam's public branch. The updater checks only before a new gameplay session; it does not poll, mutate an active session, or wake EC2. Existing hosts with legacy `UPDATE_ON_START=false` are migrated to `PZ_UPDATE_POLICY=manual` so a repository deployment cannot silently change their prior behavior.
+`PZ_UPDATE_POLICY=stable-on-start` is the default. An empty `STEAM_BRANCH` means Steam's public branch. The updater checks only before a new gameplay session; it does not poll, mutate an active session, or wake EC2.
 
 When a newer public build exists, the updater downloads it into an isolated candidate, validates the App `380870` manifest and launcher structure, creates and verifies a `pz-pre-update-*.tar.gz` world backup, then atomically selects the candidate. The previous release remains selected on every failure before world access. Once the candidate may have opened the real world, readiness failure becomes `failed-after-world-open` and automatic binary rollback is prohibited because the world may have migrated.
 
@@ -251,7 +251,7 @@ Operational controls:
 - On AWS, run `sudo pzctl update`; add `--validate` only for an explicit Steam repair. This command owns the lifecycle lock, requires a safe zero-player stop, stages the candidate, restarts, and accepts it only after health, exact RCON, and watchdog readiness.
 - Locally, ordinary `docker compose up -d server` applies the configured startup policy. Inspect `pz-updater status` and complete the client acceptance checklist before inviting players after a real build change.
 
-Git repository deployment and Steam game updating are independent transactions. The root-owned repository pending marker is mounted read-only and suppresses game checks and flat-layout migration during target start/rollback. After a managed release layout exists, `pzctl deploy` refuses a pre-updater repository commit. Never hand-edit release pointers or combine old binaries with a world touched by a newer candidate.
+Git repository deployment and Steam game updating are independent transactions. The root-owned repository pending marker is mounted read-only and suppresses game checks during target start/rollback. Never hand-edit release pointers or combine old binaries with a world touched by a newer candidate.
 
 ## Adding Mods Later
 

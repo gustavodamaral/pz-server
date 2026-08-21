@@ -112,7 +112,7 @@ The host transaction performs these steps:
 
 New hosts record their bootstrap SHA after host installation. For a host created before this deployment marker existed, first call `Deploy-PZ.ps1` with its current `git -C /opt/pz-stack rev-parse HEAD`; this intentionally reinstalls the same reviewed commit to establish a baseline before any different SHA is accepted. The SSM command execution timeout defaults to 150 minutes so the bounded target plus rollback path fits; command delivery has a separate five-minute deadline and the local waiter covers both periods plus polling margin. A timeout leaves the pending marker and requires retrying the same SHA.
 
-Changing installer defaults generally does not rewrite an existing `secrets.env`; adjust a legacy `PZ_XMX=12g` to `8g` during a measured maintenance window. The installer deliberately makes `RESTART_POLICY=no` a managed production invariant. It also migrates legacy `UPDATE_ON_START=false` to `PZ_UPDATE_POLICY=manual` (and `true` to `stable-on-start`) rather than silently changing behavior; new hosts default to automatic public Stable checks. Production systemd, not Docker's independent restart manager, owns boot ordering and the shared lifecycle lock so the container cannot start before `/srv/pz` is mounted or race a backup/deployment.
+The installer deliberately makes `RESTART_POLICY=no` a managed production invariant. Production systemd, not Docker's independent restart manager, owns boot ordering and the shared lifecycle lock so the container cannot start before `/srv/pz` is mounted or race a backup/deployment.
 
 ## Game Updates
 
