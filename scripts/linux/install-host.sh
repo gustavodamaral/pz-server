@@ -89,6 +89,7 @@ create_environment() {
         chmod 0600 "${ENV_FILE}"
         chown root:root "${ENV_FILE}"
         set_managed_environment_value RESTART_POLICY no
+        set_managed_environment_value CONTAINER_CPUS 0.0
         log INFO "Preserving existing production secrets at ${ENV_FILE}."
         return
     fi
@@ -116,7 +117,7 @@ DIRECT_PORT=16262
 RCON_PORT=27015
 PZ_XMS=2g
 PZ_XMX=4g
-CONTAINER_CPUS=4.0
+CONTAINER_CPUS=0.0
 CONTAINER_MEMORY_LIMIT=6g
 PZ_UID=1000
 PZ_GID=1000
