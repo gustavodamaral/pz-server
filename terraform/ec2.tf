@@ -50,9 +50,13 @@ resource "aws_instance" "server" {
   lifecycle {
     # Start-PZ.ps1 can safely select Normal/Party while stopped. Terraform should
     # not undo that deliberate runtime choice on the next unrelated apply.
+    # A stopped instance releases its auto-assigned public IPv4 and the provider
+    # can then report associate_public_ip_address=false. The public subnet still
+    # assigns a fresh dynamic IPv4 on the next start, so that stopped-state drift
+    # must not force an EC2 replacement.
     # Cloud-init is creation-time bootstrap input. Routine application deployment
     # uses pzctl through SSM and must never stop or replace this instance.
-    ignore_changes = [ami, instance_type, user_data]
+    ignore_changes = [ami, instance_type, user_data, associate_public_ip_address]
     replace_triggered_by = [
       aws_ebs_volume.world.id,
     ]
