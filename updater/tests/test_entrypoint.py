@@ -74,7 +74,8 @@ def test_prepare_release_ignores_noisy_prepare_stdout(tmp_path: Path) -> None:
     updater.write_text(
         "#!/usr/bin/env bash\n"
         'case "$1" in\n'
-        "  prepare-start) printf 'Steam Console Client...\\nUpdate state (0x61) downloading\\n' ;;\n"
+        "  prepare-start) printf 'Steam Console Client...\\n'"
+        "'Update state (0x61) downloading\\n' ;;\n"
         f"  active-release) printf '%s\\n' '{release}' ;;\n"
         "  *) exit 2 ;;\n"
         "esac\n",
