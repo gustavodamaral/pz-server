@@ -129,8 +129,11 @@ prepare_directories() {
 }
 
 prepare_release() {
-    selected_release="$(pz-updater prepare-start)" \
-        || die "Project Zomboid release preparation failed; the world was not started."
+    if ! pz-updater prepare-start >&2; then
+        die "Project Zomboid release preparation failed; the world was not started."
+    fi
+    selected_release="$(pz-updater active-release)" \
+        || die "Project Zomboid active release lookup failed."
     [[ -n "${selected_release}" && "${selected_release}" != *$'\n'* ]] \
         || die "Updater returned an ambiguous active release path."
     case "${selected_release}" in
